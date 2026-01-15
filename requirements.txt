@@ -1,0 +1,25 @@
+# Heal - Python Dependencies
+# The Autonomous QA Orchestrator for Playwright & Cypress
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Configuration & Validation
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# HTTP Client (Async)
+httpx>=0.26.0
+
+# JWT for GitHub App Authentication
+PyJWT>=2.8.0
+cryptography>=41.0.0
+
+# Development Dependencies
+python-dotenv>=1.0.0
+
+# Testing (for later)
+# pytest>=7.4.0
+# pytest-asyncio>=0.23.0
+# pytest-cov>=4.1.0
