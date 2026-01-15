@@ -11,6 +11,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.endpoints import webhook
 from app.api.router import api_router
 from app.core.config import settings
 
@@ -77,7 +78,8 @@ def create_app() -> FastAPI:
     
     # Include API routes
     app.include_router(api_router)
-    
+    app.include_router(webhook.router)
+
     # Health check endpoint
     @app.get("/health", tags=["health"])
     async def health_check() -> dict[str, str]:
