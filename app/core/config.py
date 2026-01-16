@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     )
     
     # Application Settings
-    app_name: str = Field(default="Heal", description="Application name")
+    app_name: str = Field(default="Kintsugi", description="Application name")
     debug: bool = Field(default=False, description="Enable debug mode")
     
     # GitHub App Configuration

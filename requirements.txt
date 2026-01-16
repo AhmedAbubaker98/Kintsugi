@@ -1,9 +1,10 @@
-# Heal - Python Dependencies
+# Kintsugi - Python Dependencies
 # The Autonomous QA Orchestrator for Playwright & Cypress
 
 # Web Framework
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
+google-generativeai>=0.4.0
 
 # Configuration & Validation
 pydantic>=2.5.0
