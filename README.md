@@ -1,4 +1,4 @@
-# Heal 🩹
+# Kintsugi
 
 **The Autonomous QA Orchestrator for Playwright & Cypress**
 
