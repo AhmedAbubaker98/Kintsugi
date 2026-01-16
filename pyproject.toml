@@ -1,12 +1,12 @@
 [project]
-name = "heal"
+name = "Kintsugi"
 version = "0.1.0"
 description = "The Autonomous QA Orchestrator for Playwright & Cypress"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Heal Team"}
+    {name = "Kintsugi Team"}
 ]
 keywords = ["github-app", "e2e-testing", "playwright", "cypress", "ai", "automation"]
 classifiers = [

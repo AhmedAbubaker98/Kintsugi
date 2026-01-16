@@ -12,6 +12,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from app.core.security import verify_webhook_signature
 from app.services.github_service import GitHubService
+from app.services.workflow_processor import WorkflowProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -189,13 +190,11 @@ async def handle_workflow_run(
         f"run_id={run_id}, installation_id={installation_id}"
     )
     
-    # TODO: Call the workflow analysis service
-    # This will be implemented in Phase 1 - Ingestion
-    # await workflow_service.analyze_failed_run(
-    #     installation_id=installation_id,
-    #     repository=repository,
-    #     workflow_run=workflow_run,
-    # )
+    if installation_id and repo_full_name and run_id:
+        processor = WorkflowProcessor()
+        # We await this directly so you can see the logs in your terminal immediately.
+        # In production, we would use FastAPI BackgroundTasks here.
+        await processor.process_failure(installation_id, repo_full_name, run_id)
     
     return {
         "status": "processing",

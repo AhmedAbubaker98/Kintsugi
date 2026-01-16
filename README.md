@@ -1,4 +1,4 @@
-# Heal 🩹
+# Kintsugi 🩹
 
 **The Autonomous QA Orchestrator for Playwright & Cypress**
 
@@ -6,12 +6,12 @@
 
 ## 🎯 Project Goal
 
-Heal is an automated QA agent that fixes broken E2E tests. It listens for GitHub Actions failures, analyzes logs/artifacts using Gemini 3, and pushes fixes automatically.
+Kintsugi is an automated QA agent that fixes broken E2E tests. It listens for GitHub Actions failures, analyzes logs/artifacts using Gemini 3, and pushes fixes automatically.
 
 ## 🏗️ Project Structure
 
 ```
-heal/
+Kintsugi/
 ├── app/
 │   ├── __init__.py
 │   ├── main.py              # FastAPI application entry point
@@ -45,8 +45,8 @@ heal/
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/heal.git
-   cd heal
+   git clone https://github.com/yourusername/Kintsugi.git
+   cd Kintsugi
    ```
 
 2. **Create virtual environment**
@@ -93,7 +93,7 @@ heal/
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/webhook` | GitHub webhook receiver |
-| `GET` | `/health` | Health check endpoint |
+| `GET` | `/Kintsugith` | Kintsugith check endpoint |
 | `GET` | `/docs` | OpenAPI documentation (debug mode only) |
 
 ## 🔒 Security

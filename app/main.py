@@ -1,5 +1,5 @@
 """
-Heal - The Autonomous QA Orchestrator.
+Kintsugi - The Autonomous QA Orchestrator.
 
 Main FastAPI application entry point.
 """

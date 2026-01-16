@@ -9,9 +9,11 @@ This service handles:
 
 import logging
 import time
+from datetime import datetime
 from typing import Any, Optional
 
 import httpx
+import jwt
 
 from app.core.config import settings
 
@@ -23,7 +25,7 @@ class GitHubService:
     Service for interacting with GitHub API as a GitHub App.
     
     This service manages authentication using GitHub App credentials
-    and provides methods for common GitHub operations needed by Heal.
+    and provides methods for common GitHub operations needed by Kintsugi.
     
     Attributes:
         app_id: The GitHub App ID.
@@ -51,6 +53,23 @@ class GitHubService:
         
         # Cache for installation tokens
         self._token_cache: dict[int, dict[str, Any]] = {}
+
+    def _iso_to_epoch(self, value: str) -> float:
+        """Convert GitHub ISO8601 timestamp to epoch seconds."""
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+    def _build_headers(self, token: str, accept: Optional[str] = None) -> dict[str, str]:
+        """Build standard GitHub API headers."""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": accept or "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        return headers
+
+    def _install_headers(self, installation_token: str, accept: Optional[str] = None) -> dict[str, str]:
+        """Headers for installation-scoped requests."""
+        return self._build_headers(installation_token, accept)
     
     async def get_app_jwt(self) -> str:
         """
@@ -65,23 +84,30 @@ class GitHubService:
         Note:
             JWTs are valid for up to 10 minutes.
         """
-        # TODO: Implement JWT generation using PyJWT
-        # This requires:
-        # 1. Creating a payload with iat, exp, and iss claims
-        # 2. Signing with RS256 algorithm using the private key
-        #
-        # import jwt
-        # now = int(time.time())
-        # payload = {
-        #     "iat": now - 60,  # Issued at (60 seconds in the past for clock drift)
-        #     "exp": now + (10 * 60),  # Expires in 10 minutes
-        #     "iss": self.app_id,
-        # }
-        # return jwt.encode(payload, self.private_key, algorithm="RS256")
-        
+        now = int(time.time())
+        payload = {
+            "iat": now - 60,
+            "exp": now + (10 * 60),
+            "iss": self.app_id,
+        }
         logger.debug("Generating GitHub App JWT")
-        raise NotImplementedError("JWT generation not yet implemented")
+        return jwt.encode(payload, self.private_key, algorithm="RS256")
     
+    async def list_workflow_artifacts(self, token: str, repo_full_name: str, run_id: int) -> dict:
+        """
+        Lists all artifacts for a specific workflow run.
+        """
+        url = f"{self.base_url}/repos/{repo_full_name}/actions/runs/{run_id}/artifacts"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        
     async def get_installation_token(self, installation_id: int) -> str:
         """
         Get an installation access token for a specific installation.
@@ -104,31 +130,21 @@ class GitHubService:
             logger.debug(f"Using cached token for installation {installation_id}")
             return cached["token"]
         
-        # TODO: Implement token fetching
-        # This requires:
-        # 1. Getting a JWT
-        # 2. POST to /app/installations/{installation_id}/access_tokens
-        # 3. Caching the response
-        #
-        # jwt = await self.get_app_jwt()
-        # async with httpx.AsyncClient() as client:
-        #     response = await client.post(
-        #         f"{self.base_url}/app/installations/{installation_id}/access_tokens",
-        #         headers={
-        #             "Authorization": f"Bearer {jwt}",
-        #             "Accept": "application/vnd.github+json",
-        #         },
-        #     )
-        #     response.raise_for_status()
-        #     data = response.json()
-        #     self._token_cache[installation_id] = {
-        #         "token": data["token"],
-        #         "expires_at": parse_iso_datetime(data["expires_at"]).timestamp(),
-        #     }
-        #     return data["token"]
-        
         logger.debug(f"Getting installation token for {installation_id}")
-        raise NotImplementedError("Installation token fetching not yet implemented")
+        app_jwt = await self.get_app_jwt()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/app/installations/{installation_id}/access_tokens",
+                headers=self._build_headers(app_jwt),
+            )
+            response.raise_for_status()
+            data = response.json()
+            expires_at = self._iso_to_epoch(data["expires_at"])
+            self._token_cache[installation_id] = {
+                "token": data["token"],
+                "expires_at": expires_at,
+            }
+            return data["token"]
     
     async def get_repository_content(
         self,
@@ -151,11 +167,17 @@ class GitHubService:
         Returns:
             dict: The file content and metadata.
         """
-        # TODO: Implement content fetching
-        # GET /repos/{owner}/{repo}/contents/{path}?ref={ref}
-        
         logger.debug(f"Fetching content: {owner}/{repo}/{path}@{ref}")
-        raise NotImplementedError("Repository content fetching not yet implemented")
+        token = await self.get_installation_token(installation_id)
+        params = {"ref": ref} if ref else None
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/repos/{owner}/{repo}/contents/{path}",
+                headers=self._install_headers(token),
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json()
     
     async def get_pr_diff(
         self,
@@ -176,12 +198,15 @@ class GitHubService:
         Returns:
             str: The diff in unified diff format.
         """
-        # TODO: Implement PR diff fetching
-        # GET /repos/{owner}/{repo}/pulls/{pull_number}
-        # with Accept: application/vnd.github.diff
-        
         logger.debug(f"Fetching PR diff: {owner}/{repo}#{pull_number}")
-        raise NotImplementedError("PR diff fetching not yet implemented")
+        token = await self.get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/repos/{owner}/{repo}/pulls/{pull_number}",
+                headers=self._install_headers(token, "application/vnd.github.diff"),
+            )
+            response.raise_for_status()
+            return response.text
     
     async def get_workflow_run_artifacts(
         self,
@@ -202,11 +227,16 @@ class GitHubService:
         Returns:
             list: List of artifact metadata dictionaries.
         """
-        # TODO: Implement artifact listing
-        # GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts
-        
         logger.debug(f"Listing artifacts for run: {owner}/{repo}/runs/{run_id}")
-        raise NotImplementedError("Artifact listing not yet implemented")
+        token = await self.get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+                headers=self._install_headers(token),
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("artifacts", [])
     
     async def download_artifact(
         self,
@@ -227,11 +257,15 @@ class GitHubService:
         Returns:
             bytes: The artifact ZIP file contents.
         """
-        # TODO: Implement artifact download
-        # GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip
-        
         logger.debug(f"Downloading artifact: {owner}/{repo}/artifacts/{artifact_id}")
-        raise NotImplementedError("Artifact download not yet implemented")
+        token = await self.get_installation_token(installation_id)
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.get(
+                f"{self.base_url}/repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip",
+                headers=self._install_headers(token, "application/vnd.github+json"),
+            )
+            response.raise_for_status()
+            return response.content
     
     async def get_workflow_run_logs(
         self,
@@ -252,11 +286,15 @@ class GitHubService:
         Returns:
             bytes: The logs ZIP file contents.
         """
-        # TODO: Implement log download
-        # GET /repos/{owner}/{repo}/actions/runs/{run_id}/logs
-        
         logger.debug(f"Downloading logs for run: {owner}/{repo}/runs/{run_id}")
-        raise NotImplementedError("Log download not yet implemented")
+        token = await self.get_installation_token(installation_id)
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.get(
+                f"{self.base_url}/repos/{owner}/{repo}/actions/runs/{run_id}/logs",
+                headers=self._install_headers(token, "application/vnd.github+json"),
+            )
+            response.raise_for_status()
+            return response.content
     
     async def create_commit(
         self,
@@ -283,15 +321,68 @@ class GitHubService:
         Returns:
             dict: The created commit metadata.
         """
-        # TODO: Implement commit creation
-        # This requires:
-        # 1. Creating blobs for each file
-        # 2. Creating a tree with the new blobs
-        # 3. Creating a commit pointing to the tree
-        # 4. Updating the branch reference
-        
         logger.debug(f"Creating commit on {owner}/{repo}:{branch}")
-        raise NotImplementedError("Commit creation not yet implemented")
+        token = await self.get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            # Get parent commit to obtain tree
+            commit_resp = await client.get(
+                f"{self.base_url}/repos/{owner}/{repo}/git/commits/{parent_sha}",
+                headers=self._install_headers(token),
+            )
+            commit_resp.raise_for_status()
+            parent_commit = commit_resp.json()
+            base_tree = parent_commit["tree"]["sha"]
+
+            # Create blobs
+            tree_items = []
+            for file_path, content in files.items():
+                blob_resp = await client.post(
+                    f"{self.base_url}/repos/{owner}/{repo}/git/blobs",
+                    headers=self._install_headers(token),
+                    json={"content": content, "encoding": "utf-8"},
+                )
+                blob_resp.raise_for_status()
+                blob_sha = blob_resp.json()["sha"]
+                tree_items.append(
+                    {
+                        "path": file_path,
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": blob_sha,
+                    }
+                )
+
+            # Create tree
+            tree_resp = await client.post(
+                f"{self.base_url}/repos/{owner}/{repo}/git/trees",
+                headers=self._install_headers(token),
+                json={"base_tree": base_tree, "tree": tree_items},
+            )
+            tree_resp.raise_for_status()
+            tree_sha = tree_resp.json()["sha"]
+
+            # Create commit
+            commit_create_resp = await client.post(
+                f"{self.base_url}/repos/{owner}/{repo}/git/commits",
+                headers=self._install_headers(token),
+                json={
+                    "message": message,
+                    "tree": tree_sha,
+                    "parents": [parent_sha],
+                },
+            )
+            commit_create_resp.raise_for_status()
+            commit_data = commit_create_resp.json()
+            new_sha = commit_data["sha"]
+
+            # Update ref
+            ref_resp = await client.patch(
+                f"{self.base_url}/repos/{owner}/{repo}/git/refs/heads/{branch}",
+                headers=self._install_headers(token),
+                json={"sha": new_sha, "force": False},
+            )
+            ref_resp.raise_for_status()
+            return commit_data
     
     async def push_commit(
         self,
@@ -319,12 +410,26 @@ class GitHubService:
         Returns:
             dict: The created commit metadata.
         """
-        # TODO: Implement high-level push
-        # 1. Get current branch ref to find parent SHA
-        # 2. Call create_commit
-        
         logger.debug(f"Pushing commit to {owner}/{repo}:{branch}")
-        raise NotImplementedError("Push commit not yet implemented")
+        token = await self.get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            ref_resp = await client.get(
+                f"{self.base_url}/repos/{owner}/{repo}/git/refs/heads/{branch}",
+                headers=self._install_headers(token),
+            )
+            ref_resp.raise_for_status()
+            ref_data = ref_resp.json()
+            parent_sha = ref_data["object"]["sha"]
+
+        return await self.create_commit(
+            installation_id=installation_id,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            message=message,
+            files=files,
+            parent_sha=parent_sha,
+        )
     
     async def create_pr_comment(
         self,
@@ -347,11 +452,16 @@ class GitHubService:
         Returns:
             dict: The created comment metadata.
         """
-        # TODO: Implement PR comment creation
-        # POST /repos/{owner}/{repo}/issues/{pull_number}/comments
-        
         logger.debug(f"Creating comment on {owner}/{repo}#{pull_number}")
-        raise NotImplementedError("PR comment creation not yet implemented")
+        token = await self.get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/repos/{owner}/{repo}/issues/{pull_number}/comments",
+                headers=self._install_headers(token),
+                json={"body": body},
+            )
+            response.raise_for_status()
+            return response.json()
     
     async def get_pull_request(
         self,
@@ -372,8 +482,12 @@ class GitHubService:
         Returns:
             dict: Pull request metadata.
         """
-        # TODO: Implement PR fetching
-        # GET /repos/{owner}/{repo}/pulls/{pull_number}
-        
         logger.debug(f"Fetching PR: {owner}/{repo}#{pull_number}")
-        raise NotImplementedError("PR fetching not yet implemented")
+        token = await self.get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/repos/{owner}/{repo}/pulls/{pull_number}",
+                headers=self._install_headers(token),
+            )
+            response.raise_for_status()
+            return response.json()
