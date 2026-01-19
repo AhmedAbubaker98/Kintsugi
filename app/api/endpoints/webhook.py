@@ -185,6 +185,9 @@ async def handle_workflow_run(
     repo_full_name = repository.get("full_name", "unknown")
     installation_id = installation.get("id")
     
+    # Extract the branch name for the commit
+    head_branch = workflow_run.get("head_branch", "main")
+    
     logger.info(
         f"Processing failed workflow: repo={repo_full_name}, "
         f"run_id={run_id}, installation_id={installation_id}"
@@ -194,7 +197,7 @@ async def handle_workflow_run(
         processor = WorkflowProcessor()
         # We await this directly so you can see the logs in your terminal immediately.
         # In production, we would use FastAPI BackgroundTasks here.
-        await processor.process_failure(installation_id, repo_full_name, run_id)
+        await processor.process_failure(installation_id, repo_full_name, run_id, head_branch)
     
     return {
         "status": "processing",
