@@ -45,7 +45,6 @@ class GeminiService:
     def __init__(self):
         """Initialize the Gemini client with API key from settings."""
         self.client = genai.Client(api_key=settings.gemini_api_key.get_secret_value())
-        self.model_name = "gemini-flash-latest" # DO NOT CHANGE MODEL
         self.debug_dir = "debug_prompts"
         self.output_dir = "debug_outputs"
         os.makedirs(self.debug_dir, exist_ok=True)
@@ -101,6 +100,8 @@ class GeminiService:
         screenshot_bytes: bytes | None = None,
         context_files: dict[str, str] | None = None,
         repo_file_structure: list[str] | None = None,
+        extra_instructions: str | None = None,
+        model_name: str | None = None,
     ) -> FixResponse:
         """
         Sends the broken code, error log, screenshot, and context to Gemini.
@@ -112,13 +113,18 @@ class GeminiService:
             screenshot_bytes: PNG screenshot of the UI at failure time (optional).
             context_files: Dictionary of imported file paths to their contents.
             repo_file_structure: List of all file paths in the repository.
+            extra_instructions: Additional instructions from user config (optional).
+            model_name: Override the default model name (optional).
         
         Returns:
             FixResponse: Structured response with fixes and explanation.
         """
         has_screenshot = screenshot_bytes is not None
+        # Use provided model or fallback to default
+        active_model = model_name
+        
         try:
-            logger.info("🧠 Gemini is thinking...")
+            logger.info(f"🧠 Gemini ({active_model}) is thinking...")
 
             # Build context sections
             context_files = context_files or {}
@@ -177,6 +183,9 @@ OUTPUT: Return a JSON object with:
 - "fixes": Array of {{"file_path": "path/to/file", "content": "full corrected content"}}
 - "explanation": Brief summary of what was wrong and how you fixed it
 """
+            # Add extra instructions from user config if provided
+            if extra_instructions:
+                system_instruction += f"\n\nADDITIONAL USER INSTRUCTIONS:\n{extra_instructions}"
 
             # 2. Construct the Payload (Multimodal or Text-only)
             code_section = f"--- BROKEN TEST FILE: {primary_file_path} ---\n{primary_file_content}"
@@ -214,7 +223,7 @@ OUTPUT: Return a JSON object with:
 
             # 4. Generate
             response = self.client.models.generate_content(
-                model=self.model_name,
+                model=active_model,
                 contents=[
                     types.Content(
                         role="user",
@@ -228,7 +237,7 @@ OUTPUT: Return a JSON object with:
             result = FixResponse.model_validate_json(response.text)
             
             # Debug: Save the output for inspection
-            output_debug = f"RAW RESPONSE:\n{response.text}\n\n{'='*80}\nPARSED RESULT:\n{'='*80}\n\n"
+            output_debug = f"MODEL: {active_model}\n\nRAW RESPONSE:\n{response.text}\n\n{'='*80}\nPARSED RESULT:\n{'='*80}\n\n"
             output_debug += f"Explanation: {result.explanation}\n\n"
             output_debug += f"Fixes ({len(result.fixes)} file(s)):\n"
             for fix in result.fixes:

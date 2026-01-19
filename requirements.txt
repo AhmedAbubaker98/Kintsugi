@@ -10,6 +10,7 @@ google-genai>=1.59.0
 # Configuration & Validation
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
+PyYAML>=6.0.0
 
 # HTTP Client (Async)
 httpx>=0.26.0

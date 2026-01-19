@@ -9,6 +9,8 @@ import re
 from pathlib import PurePosixPath
 from app.services.github_service import GitHubService
 from app.services.gemini_service import GeminiService
+from app.services.config_service import ConfigService
+from app.schemas.config import KintsugiConfig
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +57,12 @@ class WorkflowProcessor:
     def __init__(self):
         self.github = GitHubService()
         self.gemini = GeminiService()
+        self.config_service = ConfigService(self.github)
 
     async def process_failure(self, installation_id: int, repo_full_name: str, run_id: int, branch: str = "main"):
         """
         Orchestrates the full self-healing pipeline:
-        Auth -> Extract Evidence -> Identify Files -> Fetch Context -> AI Analysis -> Commit Fix
+        Auth -> Load Config -> Extract Evidence -> Identify Files -> Fetch Context -> AI Analysis -> Commit Fix
         """
         try:
             # 1. Authenticate as the App
@@ -67,7 +70,15 @@ class WorkflowProcessor:
             logger.info(f"🔐 Authenticated for repo {repo_full_name}")
             owner, repo = repo_full_name.split("/")
 
-            # 2. Download Artifacts (if available)
+            # 2. Load Repository Configuration
+            config = await self.config_service.get_config(installation_id, owner, repo, ref=branch)
+            
+            # 3. Check if branch is allowed
+            if not self.config_service.is_branch_allowed(config, branch):
+                logger.info(f"⏭️ Branch '{branch}' is not in allowed list. Skipping.")
+                return
+
+            # 4. Download Artifacts (if available)
             artifacts = await self._get_artifacts_with_retry(token, repo_full_name, run_id)
             
             # Initialize evidence with defaults
@@ -136,15 +147,20 @@ class WorkflowProcessor:
 
             broken_file_content = base64.b64decode(file_data["content"]).decode("utf-8")
 
-            # 7. Smart Context Retrieval - Parse imports and fetch related files
+            # 8. Smart Context Retrieval - Parse imports and fetch related files
             context_files = await self._fetch_context_files(
                 installation_id, owner, repo, fetch_branch,
                 broken_file_path, broken_file_content, repo_files
             )
             logger.info(f"📚 Fetched {len(context_files)} context files")
 
-            # 8. Call Gemini with full context
+            # 9. Call Gemini with full context
             logger.info("🧠 Sending to Gemini with full context...")
+            
+            # Get AI model based on config
+            model_name = self.config_service.get_model_name(config)
+            logger.info(f"🤖 Using AI model: {model_name} (mode: {config.ai.mode})")
+            
             fix_result = self.gemini.generate_fix(
                 primary_file_path=broken_file_path,
                 primary_file_content=broken_file_content,
@@ -152,25 +168,55 @@ class WorkflowProcessor:
                 screenshot_bytes=evidence["screenshot"],
                 context_files=context_files,
                 repo_file_structure=repo_files,
+                extra_instructions=config.ai.extra_instructions,
+                model_name=model_name,
             )
 
             logger.info("✨ KINTSUGI FIX GENERATED ✨")
             logger.info(f"📝 {fix_result.explanation}")
             logger.info(f"📄 {len(fix_result.fixes)} file(s) to update")
 
-            # 9. Iterative Branching Strategy
+            # 10. Validate fixes against config limits
+            if len(fix_result.fixes) > config.limits.max_files_changed:
+                logger.warning(
+                    f"⚠️ Gemini suggested {len(fix_result.fixes)} files, "
+                    f"but config limits to {config.limits.max_files_changed}. Truncating."
+                )
+                fix_result.fixes = fix_result.fixes[:config.limits.max_files_changed]
+
+            # 11. Check for protected files
+            protected_fixes = []
+            allowed_fixes = []
+            for fix in fix_result.fixes:
+                if self.config_service.is_path_protected(config, fix.file_path):
+                    protected_fixes.append(fix.file_path)
+                    logger.warning(f"🛡️ File '{fix.file_path}' is protected by config. Skipping.")
+                else:
+                    allowed_fixes.append(fix)
+            
+            if protected_fixes and not allowed_fixes:
+                logger.error(
+                    f"❌ All suggested fixes are in protected files: {protected_fixes}. "
+                    "Cannot proceed. Consider updating .github/kintsugi.yml."
+                )
+                return
+            
+            if protected_fixes:
+                logger.info(f"⏭️ Skipping protected files: {protected_fixes}")
+
+            # 12. Iterative Branching Strategy
             target_branch, base_branch, is_new_branch = await self._determine_branch_strategy(
                 token, repo_full_name, branch, installation_id, owner, repo
             )
 
-            # 10. Apply all fixes
-            for fix in fix_result.fixes:
+            # 13. Apply allowed fixes only
+            for fix in allowed_fixes:
                 await self._apply_fix(
                     token, installation_id, owner, repo, repo_full_name,
                     target_branch, fix.file_path, fix.content, fix_result.explanation
                 )
 
-            # 11. Open PR only if we created a new branch
+            # 14. Open PR only if we created a new branch
             if is_new_branch:
                 await self._open_pull_request(
                     token, repo_full_name, target_branch, base_branch,
