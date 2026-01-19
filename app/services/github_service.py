@@ -7,6 +7,7 @@ This service handles:
 - Pull Request operations (comments, commits)
 """
 
+import base64
 import logging
 import time
 from datetime import datetime
@@ -165,7 +166,7 @@ class GitHubService:
             ref: Git reference (branch, tag, or commit SHA).
         
         Returns:
-            dict: The file content and metadata.
+            dict | None: The file content and metadata, or None if not found.
         """
         logger.debug(f"Fetching content: {owner}/{repo}/{path}@{ref}")
         token = await self.get_installation_token(installation_id)
@@ -176,6 +177,9 @@ class GitHubService:
                 headers=self._install_headers(token),
                 params=params,
             )
+            if response.status_code == 404:
+                logger.warning(f"File not found: {owner}/{repo}/{path}@{ref}")
+                return None
             response.raise_for_status()
             return response.json()
     
@@ -491,3 +495,210 @@ class GitHubService:
             )
             response.raise_for_status()
             return response.json()
+
+    async def update_file(
+        self,
+        token: str,
+        repo_full_name: str,
+        path: str,
+        message: str,
+        content: str,
+        sha: str,
+        branch: str = "main"
+    ) -> dict[str, Any]:
+        """
+        Commits a file update to GitHub.
+        
+        Args:
+            token: Installation access token.
+            repo_full_name: Full repository name (owner/repo).
+            path: Path to the file in the repository.
+            message: Commit message.
+            content: New file content (will be Base64 encoded).
+            sha: Current file SHA (for conflict detection).
+            branch: Target branch name.
+        
+        Returns:
+            dict: Commit response from GitHub API.
+        """
+        url = f"{self.base_url}/repos/{repo_full_name}/contents/{path}"
+        headers = self._install_headers(token)
+        
+        # GitHub API expects content to be Base64 encoded
+        encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+        
+        payload = {
+            "message": message,
+            "content": encoded_content,
+            "sha": sha,
+            "branch": branch
+        }
+
+        logger.debug(f"Updating file: {repo_full_name}/{path} on branch {branch}")
+        async with httpx.AsyncClient() as client:
+            response = await client.put(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+
+    async def get_branch_sha(
+        self,
+        token: str,
+        repo_full_name: str,
+        branch: str
+    ) -> str:
+        """
+        Get the latest commit SHA for a branch.
+        
+        Args:
+            token: Installation access token.
+            repo_full_name: Full repository name (owner/repo).
+            branch: Branch name.
+        
+        Returns:
+            str: The SHA of the latest commit on the branch.
+        """
+        url = f"{self.base_url}/repos/{repo_full_name}/git/ref/heads/{branch}"
+        headers = self._install_headers(token)
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            return data["object"]["sha"]
+
+    async def create_branch(
+        self,
+        token: str,
+        repo_full_name: str,
+        new_branch_name: str,
+        source_sha: str
+    ) -> dict[str, Any]:
+        """
+        Creates a new git branch (reference) from a source commit SHA.
+        
+        Args:
+            token: Installation access token.
+            repo_full_name: Full repository name (owner/repo).
+            new_branch_name: Name for the new branch.
+            source_sha: SHA of the commit to branch from.
+        
+        Returns:
+            dict: Reference creation response from GitHub API.
+        """
+        url = f"{self.base_url}/repos/{repo_full_name}/git/refs"
+        headers = self._install_headers(token)
+        
+        payload = {
+            "ref": f"refs/heads/{new_branch_name}",
+            "sha": source_sha
+        }
+
+        logger.debug(f"Creating branch: {new_branch_name} from {source_sha[:8]}")
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+
+    async def create_pull_request(
+        self,
+        token: str,
+        repo_full_name: str,
+        title: str,
+        body: str,
+        head: str,
+        base: str
+    ) -> dict[str, Any]:
+        """
+        Opens a Pull Request.
+        
+        Args:
+            token: Installation access token.
+            repo_full_name: Full repository name (owner/repo).
+            title: PR title.
+            body: PR description/body.
+            head: Source branch (the branch with changes).
+            base: Target branch (where changes will be merged).
+        
+        Returns:
+            dict: Pull request creation response from GitHub API.
+        """
+        url = f"{self.base_url}/repos/{repo_full_name}/pulls"
+        headers = self._install_headers(token)
+        
+        payload = {
+            "title": title,
+            "body": body,
+            "head": head,
+            "base": base
+        }
+
+        logger.debug(f"Creating PR: {head} -> {base}")
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+
+    async def list_repository_files(
+        self,
+        token: str,
+        repo_full_name: str,
+        ref: Optional[str] = None,
+        path: str = ""
+    ) -> list[str]:
+        """
+        List all files in a repository using the Git Trees API.
+        
+        Args:
+            token: Installation access token.
+            repo_full_name: Full repository name (owner/repo).
+            ref: Git reference (branch, tag, or commit SHA). Defaults to default branch.
+            path: Optional path prefix to filter results.
+        
+        Returns:
+            list[str]: List of file paths in the repository.
+        """
+        # First get the tree SHA for the ref
+        ref = ref or "HEAD"
+        url = f"{self.base_url}/repos/{repo_full_name}/git/trees/{ref}?recursive=1"
+        headers = self._install_headers(token)
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+        # Filter to only files (blobs), not directories (trees)
+        files = [
+            item["path"] for item in data.get("tree", [])
+            if item["type"] == "blob"
+        ]
+        
+        # Filter by path prefix if provided
+        if path:
+            files = [f for f in files if f.startswith(path)]
+            
+        return files
+
+    async def check_branch_exists(
+        self,
+        token: str,
+        repo_full_name: str,
+        branch: str
+    ) -> bool:
+        """
+        Check if a branch exists in the repository.
+        
+        Args:
+            token: Installation access token.
+            repo_full_name: Full repository name (owner/repo).
+            branch: Branch name to check.
+        
+        Returns:
+            bool: True if branch exists, False otherwise.
+        """
+        url = f"{self.base_url}/repos/{repo_full_name}/git/ref/heads/{branch}"
+        headers = self._install_headers(token)
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers)
+            return response.status_code == 200

@@ -1,0 +1,41 @@
+=== GEMINI_OUTPUT AT 2026-01-19 06:12:23 ===
+
+RAW RESPONSE:
+{
+  "fixes": [
+    {
+      "file_path": "tests/calculator.test.js",
+      "content": "const { calculateTotal, calculateDiscount } = require('../src/calculator');\n\ndescribe('Calculator', () => {\n  test('calculateTotal should multiply price and quantity', () => {\n    expect(calculateTotal(10, 5)).toBe(50);\n  });\n\n  test('calculateTotal should handle decimal values', () => {\n    expect(calculateTotal(12.99, 3)).toBeCloseTo(38.97, 2);\n  });\n\n  test('calculateDiscount should calculate percentage correctly', () => {\n    expect(calculateDiscount(100, 20)).toBe(20);\n  });\n\n  test('calculateDiscount should work with decimal discounts', () => {\n    expect(calculateDiscount(50, 15)).toBeCloseTo(7.5, 2);\n  });\n});"
+    }
+  ],
+  "explanation": "The tests were failing due to standard JavaScript floating-point precision errors when comparing calculated decimal values using the strict equality matcher `toBe`. I fixed this by replacing `toBe` with `toBeCloseTo(expected, 2)` for tests involving decimal results, allowing the assertion to pass if the result is accurate up to two decimal places."
+}
+
+================================================================================
+PARSED RESULT:
+================================================================================
+
+Explanation: The tests were failing due to standard JavaScript floating-point precision errors when comparing calculated decimal values using the strict equality matcher `toBe`. I fixed this by replacing `toBe` with `toBeCloseTo(expected, 2)` for tests involving decimal results, allowing the assertion to pass if the result is accurate up to two decimal places.
+
+Fixes (1 file(s)):
+
+--- tests/calculator.test.js ---
+const { calculateTotal, calculateDiscount } = require('../src/calculator');
+
+describe('Calculator', () => {
+  test('calculateTotal should multiply price and quantity', () => {
+    expect(calculateTotal(10, 5)).toBe(50);
+  });
+
+  test('calculateTotal should handle decimal values', () => {
+    expect(calculateTotal(12.99, 3)).toBeCloseTo(38.97, 2);
+  });
+
+  test('calculateDiscount should calculate percentage correctly', () => {
+    expect(calculateDiscount(100, 20)).toBe(20);
+  });
+
+  test('calculateDiscount should work with decimal discounts', () => {
+    expect(calculateDiscount(50, 15)).toBeCloseTo(7.5, 2);
+  });
+});

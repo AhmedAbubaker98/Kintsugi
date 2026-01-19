@@ -1,0 +1,99 @@
+=== SENT_PROMPT AT 2026-01-19 06:27:32 ===
+
+
+You are Kintsugi, an expert Senior Software Development Engineer in Test.
+Your goal is to fix broken E2E tests (Playwright, Cypress, Selenium, etc.) by synthesizing Code, Logs, and Visuals.
+
+ANALYZING: tests/calculator.test.js
+
+INPUTS:
+1. **BROKEN TEST FILE**: The primary test file that failed.
+2. **IMPORTED DEPENDENCIES**: Files imported by the test (Page Objects, helpers, components).
+3. **ERROR LOG**: The runtime exception from CI/CD.
+4. **SCREENSHOT**: The visual state of the UI at the moment of failure.
+5. **REPOSITORY STRUCTURE**: List of files in the repo to understand the tech stack.
+
+YOUR ANALYSIS PROTOCOL:
+1. **Analyze the Error FIRST**: 
+   - If "Timeout/Not Found": The element is missing or the selector is wrong. Check the Screenshot.
+   - If "Strict Mode Violation" or "Ambiguous": The selector matches multiple elements. Make it more specific.
+   - If "Visual/Layout Error": The UI shifted. Adjust assertions.
+
+2. **Analyze the Screenshot**: 
+   - Compare the visual reality to the code's expectation.
+   - Identify unique attributes (data-testid, id, unique class, role with name).
+   - NEVER use a selector that could match multiple elements.
+
+3. **Check Context Files**:
+   - If the test imports Page Objects or helpers, check if selectors are defined there.
+   - The fix might need to be in an imported file, not the test itself.
+
+4. **Generate the Fix**:
+   - Apply standard best practices for stable selectors.
+   - Prefer: data-testid > id > unique class > role with name > text with container context.
+   - You may return fixes for MULTIPLE files if needed.
+
+OUTPUT: Return a JSON object with:
+- "fixes": Array of {"file_path": "path/to/file", "content": "full corrected content"}
+- "explanation": Brief summary of what was wrong and how you fixed it
+
+
+================================================================================
+USER CONTENT:
+================================================================================
+
+--- BROKEN TEST FILE: tests/calculator.test.js ---
+const { calculateTotal, calculateDiscount } = require('../src/calculator');
+
+describe('Calculator', () => {
+  test('calculateTotal should multiply price and quantity', () => {
+    expect(calculateTotal(10, 5)).toBe(50);
+  });
+
+  test('calculateTotal should handle decimal values', () => {
+    expect(calculateTotal(12.99, 3)).toBe(38.97);
+  });
+
+  test('calculateDiscount should calculate percentage correctly', () => {
+    expect(calculateDiscount(100, 20)).toBe(20);
+  });
+
+  test('calculateDiscount should work with decimal discounts', () => {
+    expect(calculateDiscount(50, 15)).toBe(7.5);
+  }); 
+});
+
+
+--- IMPORTED DEPENDENCIES (Context Files) ---
+
+### src/calculator.js
+```
+function calculateTotal(price, quantity) {
+  return price + quantity;
+}
+
+function calculateDiscount(price, discountPercent) {
+  return price * (discountPercent / 100);
+}
+
+module.exports = {
+  calculateTotal,
+  calculateDiscount
+};
+
+```
+
+
+--- REPOSITORY FILE STRUCTURE ---
+.github/workflows/test.yml
+README.md
+package.json
+src/calculator.js
+tests/calculator.test.js
+
+--- ERROR LOG ---
+No artifact error log available.
+
+[NO SCREENSHOT AVAILABLE]
+
+Analyze the error log and code, then generate robust fix(es). Return JSON. (Note: No screenshot available for this run)
