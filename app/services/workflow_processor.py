@@ -697,3 +697,305 @@ class WorkflowProcessor:
             logger.error(f"Failed to extract evidence: {e}")
 
         return evidence
+
+    async def handle_kintsugi_success(
+        self,
+        installation_id: int,
+        repo_full_name: str,
+        branch: str,
+    ):
+        """
+        Handle successful workflow run on a Kintsugi branch.
+        Posts a success comment on the associated PR.
+        
+        Args:
+            installation_id: The GitHub App installation ID.
+            repo_full_name: Full repository name (owner/repo).
+            branch: The Kintsugi branch name.
+        """
+        try:
+            owner, repo = repo_full_name.split("/")
+            token = await self.github.get_installation_token(installation_id)
+            
+            # Find the PR associated with this branch
+            pr = await self._find_pr_for_branch(token, repo_full_name, branch)
+            if not pr:
+                logger.warning(f"No open PR found for branch '{branch}'. Cannot post success comment.")
+                return
+            
+            pr_number = pr.get("number")
+            
+            # Post success comment
+            success_comment = (
+                "## ✅ Tests Passed!\n\n"
+                "Great news! All tests are now passing on this branch. 🎉\n\n"
+                "If you need any further amendments, just mention me with **@Kintsugi** "
+                "and describe what you'd like changed.\n\n"
+                "---\n"
+                "* Kintsugi - Self-Healing Test Bot*"
+            )
+            
+            await self.github.create_pr_comment(
+                installation_id=installation_id,
+                owner=owner,
+                repo=repo,
+                pull_number=pr_number,
+                body=success_comment,
+            )
+            
+            logger.info(f"✅ Posted success comment on PR #{pr_number}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to handle Kintsugi success: {e}", exc_info=True)
+
+    async def _find_pr_for_branch(
+        self,
+        token: str,
+        repo_full_name: str,
+        branch: str,
+    ) -> dict | None:
+        """
+        Find an open PR associated with a branch.
+        
+        Args:
+            token: GitHub installation token.
+            repo_full_name: Full repository name (owner/repo).
+            branch: Branch name to search for.
+        
+        Returns:
+            dict | None: PR data if found, None otherwise.
+        """
+        import httpx
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://api.github.com/repos/{repo_full_name}/pulls",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                params={"head": f"{repo_full_name.split('/')[0]}:{branch}", "state": "open"},
+            )
+            if response.status_code == 200:
+                prs = response.json()
+                if prs:
+                    return prs[0]  # Return the first matching PR
+        return None
+
+    async def process_comment(
+        self,
+        installation_id: int,
+        repo_full_name: str,
+        pr_number: int,
+        comment_body: str,
+        comment_author: str,
+    ):
+        """
+        Process a comment mentioning @Kintsugi and generate amendments.
+        
+        Args:
+            installation_id: The GitHub App installation ID.
+            repo_full_name: Full repository name (owner/repo).
+            pr_number: The PR number where the comment was made.
+            comment_body: The comment text.
+            comment_author: GitHub username of the commenter.
+        """
+        try:
+            owner, repo = repo_full_name.split("/")
+            token = await self.github.get_installation_token(installation_id)
+            
+            logger.info(f"🗣️ Processing @Kintsugi mention on PR #{pr_number} by @{comment_author}")
+            
+            # 1. Get PR details to find the branch
+            pr = await self.github.get_pull_request(installation_id, owner, repo, pr_number)
+            head_branch = pr.get("head", {}).get("ref", "")
+            base_branch = pr.get("base", {}).get("ref", "main")
+            
+            # Verify this is a Kintsugi PR
+            if not head_branch.startswith("kintsugi-fix"):
+                logger.info(f"PR #{pr_number} is not a Kintsugi PR (branch: {head_branch}). Ignoring.")
+                return
+            
+            # 2. Load config
+            config = await self.config_service.get_config(installation_id, owner, repo, ref=base_branch)
+            
+            # 3. Get files changed by Kintsugi in this PR
+            changed_files = await self._get_pr_changed_files(token, repo_full_name, pr_number)
+            if not changed_files:
+                logger.warning("Could not find any changed files in this PR")
+                return
+            
+            logger.info(f"📄 PR has {len(changed_files)} changed file(s): {list(changed_files.keys())}")
+            
+            # 4. Get repository file structure
+            repo_files = await self.github.list_repository_files(token, repo_full_name, ref=head_branch)
+            
+            # 5. Parse comment for mentioned file paths
+            mentioned_files = self._parse_file_mentions(comment_body, repo_files)
+            logger.info(f"📝 Files mentioned in comment: {mentioned_files}")
+            
+            # 6. Fetch context files (imports from changed files + mentioned files)
+            context_files = {}
+            for file_path, content in changed_files.items():
+                file_context = await self._fetch_context_files(
+                    installation_id, owner, repo, head_branch,
+                    file_path, content, repo_files
+                )
+                context_files.update(file_context)
+            
+            # Also fetch mentioned files if not already in changed_files
+            for mentioned in mentioned_files:
+                if mentioned not in changed_files and mentioned not in context_files:
+                    file_data = await self.github.get_repository_content(
+                        installation_id, owner, repo, mentioned, ref=head_branch
+                    )
+                    if file_data:
+                        context_files[mentioned] = base64.b64decode(file_data["content"]).decode("utf-8")
+            
+            logger.info(f"📚 Fetched {len(context_files)} context files")
+            
+            # 7. Get AI model from config
+            model_name = self.config_service.get_model_name(config)
+            
+            # 8. Call Gemini to generate amendments
+            logger.info("🧠 Sending to Gemini for amendment generation...")
+            amendment_result = self.gemini.generate_amendment(
+                comment_body=comment_body,
+                comment_author=comment_author,
+                changed_files=changed_files,
+                context_files=context_files,
+                mentioned_files=mentioned_files,
+                repo_file_structure=repo_files,
+                extra_instructions=config.ai.extra_instructions,
+                model_name=model_name,
+            )
+            
+            logger.info(f"✨ Gemini generated {len(amendment_result.fixes)} amendment(s)")
+            
+            # 9. Apply the amendments (commit to the same branch)
+            if amendment_result.fixes:
+                for fix in amendment_result.fixes:
+                    # Check protected paths
+                    if self.config_service.is_path_protected(config, fix.file_path):
+                        logger.warning(f"🛡️ Skipping protected file: {fix.file_path}")
+                        continue
+                    
+                    await self._apply_fix(
+                        token, installation_id, owner, repo, repo_full_name,
+                        head_branch, fix.file_path, fix.content,
+                        f"Kintsugi amendment per @{comment_author}'s feedback"
+                    )
+            
+            # 10. Post reply comment
+            reply_body = f"{amendment_result.reply}\n\n---\n*🤖 Kintsugi - Self-Healing Test Bot*"
+            await self.github.create_pr_comment(
+                installation_id=installation_id,
+                owner=owner,
+                repo=repo,
+                pull_number=pr_number,
+                body=reply_body,
+            )
+            
+            logger.info(f"✅ Posted amendment reply on PR #{pr_number}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to process comment: {e}", exc_info=True)
+
+    async def _get_pr_changed_files(
+        self,
+        token: str,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> dict[str, str]:
+        """
+        Get all files changed in a PR with their current content.
+        
+        Args:
+            token: GitHub installation token.
+            repo_full_name: Full repository name (owner/repo).
+            pr_number: The PR number.
+        
+        Returns:
+            dict: Mapping of file paths to their content.
+        """
+        import httpx
+        
+        changed_files = {}
+        owner, repo = repo_full_name.split("/")
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                # Get list of files changed in PR
+                response = await client.get(
+                    f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}/files",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                response.raise_for_status()
+                files = response.json()
+                
+                # Fetch content for each file
+                for file_info in files:
+                    file_path = file_info.get("filename")
+                    if file_path and file_info.get("status") != "removed":
+                        # Get file content from the PR's head branch
+                        content_response = await client.get(
+                            file_info.get("contents_url"),
+                            headers={
+                                "Authorization": f"Bearer {token}",
+                                "Accept": "application/vnd.github+json",
+                            },
+                        )
+                        if content_response.status_code == 200:
+                            content_data = content_response.json()
+                            content = base64.b64decode(content_data.get("content", "")).decode("utf-8")
+                            changed_files[file_path] = content
+        
+        except Exception as e:
+            logger.error(f"Failed to get PR changed files: {e}")
+        
+        return changed_files
+
+    def _parse_file_mentions(self, comment_body: str, repo_files: list[str]) -> list[str]:
+        """
+        Parse a comment for mentioned file paths or directories.
+        
+        Args:
+            comment_body: The comment text.
+            repo_files: List of all files in the repository.
+        
+        Returns:
+            list: File paths mentioned in the comment that exist in the repo.
+        """
+        mentioned = []
+        
+        # Common patterns for file mentions
+        patterns = [
+            # Explicit paths: "check src/pages/login.ts" or "look at tests/e2e/auth.spec.ts"
+            r'(?:check|look at|see|update|fix|modify|change|in|at|file)\s+[`"\']?([a-zA-Z0-9_\-./]+\.[a-zA-Z]+)[`"\']?',
+            # Backtick wrapped: `src/utils/helper.ts`
+            r'`([a-zA-Z0-9_\-./]+\.[a-zA-Z]+)`',
+            # Just paths that look like files (with extension)
+            r'\b([a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-./]+\.[a-zA-Z]{2,4})\b',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, comment_body, re.IGNORECASE)
+            for match in matches:
+                # Check if this file exists in the repo
+                if match in repo_files:
+                    if match not in mentioned:
+                        mentioned.append(match)
+                else:
+                    # Try to find partial matches (e.g., "login.ts" might match "src/pages/login.ts")
+                    for repo_file in repo_files:
+                        if repo_file.endswith(match) or match in repo_file:
+                            if repo_file not in mentioned:
+                                mentioned.append(repo_file)
+                                break
+        
+        return mentioned

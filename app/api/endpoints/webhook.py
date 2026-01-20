@@ -121,6 +121,9 @@ async def route_event(
         case "check_run":
             return await handle_check_run(payload, delivery_id)
         
+        case "issue_comment":
+            return await handle_issue_comment(payload, delivery_id)
+        
         case "ping":
             return handle_ping(payload)
         
@@ -172,12 +175,6 @@ async def handle_workflow_run(
             "reason": f"Workflow action is '{action}', not 'completed'",
         }
     
-    if conclusion != "failure":
-        return {
-            "status": "ignored",
-            "reason": f"Workflow conclusion is '{conclusion}', not 'failure'",
-        }
-    
     # Extract repository and installation info
     repository = payload.get("repository", {})
     installation = payload.get("installation", {})
@@ -187,6 +184,30 @@ async def handle_workflow_run(
     
     # Extract the branch name for the commit
     head_branch = workflow_run.get("head_branch", "main")
+    
+    # Handle successful workflow runs on Kintsugi branches
+    if conclusion == "success" and head_branch.startswith("kintsugi-fix"):
+        logger.info(
+            f"🎉 Kintsugi fix succeeded! repo={repo_full_name}, "
+            f"branch={head_branch}, run_id={run_id}"
+        )
+        if installation_id and repo_full_name:
+            processor = WorkflowProcessor()
+            await processor.handle_kintsugi_success(
+                installation_id, repo_full_name, head_branch
+            )
+        return {
+            "status": "processed",
+            "event": "workflow_run",
+            "delivery_id": delivery_id,
+            "message": "Kintsugi fix succeeded - posted success comment",
+        }
+    
+    if conclusion != "failure":
+        return {
+            "status": "ignored",
+            "reason": f"Workflow conclusion is '{conclusion}', not 'failure'",
+        }
     
     logger.info(
         f"Processing failed workflow: repo={repo_full_name}, "
@@ -263,4 +284,85 @@ def handle_ping(payload: dict[str, Any]) -> dict[str, Any]:
         "event": "ping",
         "message": "Pong! Webhook is configured correctly.",
         "zen": zen,
+    }
+
+
+async def handle_issue_comment(
+    payload: dict[str, Any],
+    delivery_id: str,
+) -> dict[str, Any]:
+    """
+    Handle issue_comment events from GitHub.
+    
+    This handles comments on PRs that mention @kintsugi, allowing
+    users to request amendments to Kintsugi's fixes.
+    
+    Args:
+        payload: The issue_comment event payload.
+        delivery_id: Unique delivery identifier.
+    
+    Returns:
+        dict: Response indicating processing status.
+    """
+    action = payload.get("action")
+    comment = payload.get("comment", {})
+    issue = payload.get("issue", {})
+    repository = payload.get("repository", {})
+    installation = payload.get("installation", {})
+    
+    comment_body = comment.get("body", "")
+    comment_author = comment.get("user", {}).get("login", "unknown")
+    issue_number = issue.get("number")
+    repo_full_name = repository.get("full_name", "unknown")
+    installation_id = installation.get("id")
+    
+    logger.info(
+        f"Issue comment event: action={action}, "
+        f"issue=#{issue_number}, author={comment_author}, "
+        f"repo={repo_full_name}"
+    )
+    
+    # Only process newly created comments
+    if action != "created":
+        return {
+            "status": "ignored",
+            "reason": f"Comment action is '{action}', not 'created'",
+        }
+    
+    # Check if this is a PR (issues and PRs share the same comment API)
+    if "pull_request" not in issue:
+        return {
+            "status": "ignored",
+            "reason": "Comment is on an issue, not a pull request",
+        }
+    
+    # Check if @kintsugi is mentioned (case-insensitive)
+    if "@kintsugi" not in comment_body.lower():
+        return {
+            "status": "ignored",
+            "reason": "Comment does not mention @kintsugi",
+        }
+    
+    logger.info(
+        f"🗣️ @Kintsugi mentioned in PR #{issue_number} by {comment_author}: "
+        f"'{comment_body[:100]}...'"
+    )
+    
+    if installation_id and repo_full_name and issue_number:
+        processor = WorkflowProcessor()
+        await processor.process_comment(
+            installation_id=installation_id,
+            repo_full_name=repo_full_name,
+            pr_number=issue_number,
+            comment_body=comment_body,
+            comment_author=comment_author,
+        )
+    
+    return {
+        "status": "processing",
+        "event": "issue_comment",
+        "delivery_id": delivery_id,
+        "pr_number": issue_number,
+        "repository": repo_full_name,
+        "message": "@Kintsugi mention queued for processing",
     }

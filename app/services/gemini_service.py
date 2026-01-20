@@ -40,6 +40,17 @@ class FixResponse(BaseModel):
     )
 
 
+class AmendmentResponse(BaseModel):
+    """Structured response from Gemini for comment-based amendments."""
+    
+    fixes: list[FileFix] = Field(
+        description="List of file fixes to apply based on the user's feedback."
+    )
+    reply: str = Field(
+        description="A friendly reply to the user explaining what changes were made (will be posted as a PR comment)."
+    )
+
+
 class GeminiService:
     """
     Service for generating test fixes using Google Gemini.
@@ -376,6 +387,151 @@ OUTPUT: Return a JSON object with:
 
         except Exception as e:
             logger.error(f"❌ Gemini Generation Failed: {e}")
+            raise
+
+    def generate_amendment(
+        self,
+        comment_body: str,
+        comment_author: str,
+        changed_files: dict[str, str],
+        context_files: dict[str, str] | None = None,
+        mentioned_files: list[str] | None = None,
+        repo_file_structure: list[str] | None = None,
+        extra_instructions: str | None = None,
+        model_name: str | None = None,
+    ) -> AmendmentResponse:
+        """
+        Process a user's comment/feedback and generate amendments to the fix.
+        
+        Args:
+            comment_body: The user's comment text mentioning @kintsugi.
+            comment_author: GitHub username of the commenter.
+            changed_files: Dictionary of file paths to their current content (Kintsugi's changes).
+            context_files: Dictionary of imported file paths to their contents.
+            mentioned_files: List of file paths explicitly mentioned in the comment.
+            repo_file_structure: List of all file paths in the repository.
+            extra_instructions: Additional instructions from user config (optional).
+            model_name: Override the default model name (optional).
+        
+        Returns:
+            AmendmentResponse: Structured response with fixes and a reply message.
+        """
+        active_model = model_name
+        
+        try:
+            logger.info(f"🧠 Gemini ({active_model}) processing amendment request from @{comment_author}...")
+            
+            # Build context sections
+            context_files = context_files or {}
+            mentioned_files = mentioned_files or []
+            repo_file_structure = repo_file_structure or []
+            
+            # Format changed files (Kintsugi's previous changes)
+            changed_section = "--- FILES KINTSUGI PREVIOUSLY CHANGED ---\n"
+            for path, content in changed_files.items():
+                changed_section += f"\n### {path}\n```\n{content}\n```\n"
+            
+            # Format context files (dependencies)
+            context_section = ""
+            if context_files:
+                context_section = "\n\n--- IMPORTED DEPENDENCIES (Context Files) ---\n"
+                for path, content in context_files.items():
+                    context_section += f"\n### {path}\n```\n{content}\n```\n"
+            
+            # Format mentioned files
+            mentioned_section = ""
+            if mentioned_files:
+                mentioned_section = f"\n\n--- FILES MENTIONED IN COMMENT ---\n{chr(10).join(mentioned_files)}"
+            
+            # Format file structure (truncate if too long)
+            structure_section = ""
+            if repo_file_structure:
+                truncated = repo_file_structure[:100]
+                structure_section = f"\n\n--- REPOSITORY FILE STRUCTURE ---\n{chr(10).join(truncated)}"
+                if len(repo_file_structure) > 100:
+                    structure_section += f"\n... and {len(repo_file_structure) - 100} more files"
+            
+            # System instruction for amendment processing
+            system_instruction = f"""
+You are Kintsugi, an expert Senior Software Development Engineer in Test.
+A user has commented on your Pull Request with feedback or a request for changes.
+
+YOUR TASK:
+1. Read and understand the user's feedback carefully.
+2. Look at the files you previously changed (provided below).
+3. If the user mentions specific files, pay extra attention to those.
+4. Generate the amended file content based on their request.
+5. Write a friendly, professional reply acknowledging their feedback.
+
+GUIDELINES:
+- If the user asks to change selectors, locators, or assertions, do so.
+- If the user points out an error in your fix, correct it.
+- If the user wants a different approach, implement it.
+- If files are mentioned in the comment (like "check src/pages/login.ts"), look for them in the context.
+- Your reply should be concise and explain what you changed.
+- Use a friendly tone (you're a helpful bot, not a formal assistant).
+
+USER: @{comment_author}
+
+OUTPUT: Return a JSON object with:
+- "fixes": Array of {{"file_path": "path/to/file", "content": "full corrected content"}}
+- "reply": A friendly message to post as a PR comment (1-3 sentences)
+"""
+            if extra_instructions:
+                system_instruction += f"\n\nADDITIONAL USER INSTRUCTIONS:\n{extra_instructions}"
+            
+            # Construct user content
+            user_content = [
+                types.Part.from_text(
+                    text=f"--- USER COMMENT ---\n{comment_body}\n\n{changed_section}{context_section}{mentioned_section}{structure_section}"
+                ),
+                types.Part.from_text(
+                    text="Process this feedback and generate the requested amendments. Return JSON."
+                )
+            ]
+            
+            # Debug: Save the prompt
+            debug_prompt = f"{system_instruction}\n\n{'='*80}\nUSER CONTENT:\n{'='*80}\n\n"
+            debug_prompt += f"--- USER COMMENT ---\n{comment_body}\n\n{changed_section}{context_section}{mentioned_section}{structure_section}"
+            self._save_prompt_debug(debug_prompt)
+            
+            # Configure for structured JSON output
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2,  # Slightly higher for more natural replies
+                response_mime_type="application/json",
+                response_schema=AmendmentResponse,
+            )
+            
+            # Generate
+            response = self.client.models.generate_content(
+                model=active_model,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=user_content
+                    )
+                ],
+                config=config
+            )
+            
+            # Parse the structured response
+            result = AmendmentResponse.model_validate_json(response.text)
+            
+            # Debug: Save the output
+            output_debug = f"MODEL: {active_model}\n\nRAW RESPONSE:\n{response.text}\n\n{'='*80}\nPARSED RESULT:\n{'='*80}\n\n"
+            output_debug += f"Reply: {result.reply}\n\n"
+            output_debug += f"Fixes ({len(result.fixes)} file(s)):\n"
+            for fix in result.fixes:
+                output_debug += f"\n--- {fix.file_path} ---\n{fix.content}\n"
+            self._save_output_debug(output_debug)
+            
+            logger.info(f"✅ Gemini generated {len(result.fixes)} amendment(s) successfully")
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"❌ Gemini Amendment Generation Failed: {e}")
             raise
         
         finally:
