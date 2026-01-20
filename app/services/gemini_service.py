@@ -4,10 +4,16 @@ Gemini Service for AI-powered test fix generation.
 This service uses Google's Gemini model to analyze failed tests
 by examining screenshots, error logs, and test code to generate fixes.
 Uses structured JSON output for reliable parsing.
+
+Supports multimodal analysis including:
+- Screenshots (PNG) - inline as image parts
+- Video recordings (WebM) - uploaded via File API with polling
 """
 
+import asyncio
 import logging
 import os
+import time
 from datetime import datetime
 from pydantic import BaseModel, Field
 from google import genai
@@ -51,7 +57,14 @@ class GeminiService:
     
     Uses multimodal capabilities to analyze screenshots alongside
     code and error logs to understand UI state changes.
+    
+    Supports video analysis via File API for temporal debugging
+    (timing issues, animations, spinners, button flickers).
     """
+    
+    # Video upload polling settings
+    VIDEO_POLL_INTERVAL = 2  # seconds between state checks
+    VIDEO_POLL_TIMEOUT = 120  # max seconds to wait for ACTIVE state
     
     def __init__(self):
         """Initialize the Gemini client with API key from settings."""
@@ -103,25 +116,103 @@ class GeminiService:
         """
         self._rotate_debug_file(self.output_dir, "gemini_output", output_content)
 
+    def upload_video(self, video_bytes: bytes, filename: str = "recording.webm") -> types.File | None:
+        """
+        Upload a video file to Gemini's File API and wait for it to become ACTIVE.
+        
+        Videos must be uploaded via the File API (not inline) due to processing requirements.
+        The file goes through PROCESSING state before becoming ACTIVE.
+        
+        Args:
+            video_bytes: The raw video file content (WebM format).
+            filename: Name for the uploaded file (used for identification).
+        
+        Returns:
+            types.File: The uploaded file object ready for use in prompts, or None if failed.
+        """
+        try:
+            logger.info(f"📹 Uploading video ({len(video_bytes):,} bytes) to Gemini File API...")
+            
+            # Upload the file
+            uploaded_file = self.client.files.upload(
+                file=video_bytes,
+                config=types.UploadFileConfig(
+                    display_name=filename,
+                    mime_type="video/webm"
+                )
+            )
+            
+            logger.info(f"📤 Upload initiated: {uploaded_file.name} (state: {uploaded_file.state})")
+            
+            # Poll until file is ACTIVE (or timeout)
+            start_time = time.time()
+            while uploaded_file.state == "PROCESSING":
+                elapsed = time.time() - start_time
+                if elapsed > self.VIDEO_POLL_TIMEOUT:
+                    logger.error(f"⏰ Video processing timed out after {self.VIDEO_POLL_TIMEOUT}s")
+                    self.delete_file(uploaded_file.name)
+                    return None
+                
+                logger.debug(f"⏳ Video still processing... ({elapsed:.1f}s elapsed)")
+                time.sleep(self.VIDEO_POLL_INTERVAL)
+                
+                # Refresh file state
+                uploaded_file = self.client.files.get(name=uploaded_file.name)
+            
+            if uploaded_file.state == "ACTIVE":
+                elapsed = time.time() - start_time
+                logger.info(f"✅ Video ready! Processing took {elapsed:.1f}s")
+                return uploaded_file
+            else:
+                logger.error(f"❌ Video upload failed with state: {uploaded_file.state}")
+                self.delete_file(uploaded_file.name)
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Video upload failed: {e}")
+            return None
+
+    def delete_file(self, file_name: str) -> bool:
+        """
+        Delete a file from Gemini's File API.
+        
+        Should be called after analysis to clean up uploaded videos.
+        
+        Args:
+            file_name: The name/ID of the file to delete (e.g., "files/abc123").
+        
+        Returns:
+            bool: True if deletion succeeded, False otherwise.
+        """
+        try:
+            self.client.files.delete(name=file_name)
+            logger.info(f"🗑️ Deleted uploaded file: {file_name}")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to delete file {file_name}: {e}")
+            return False
+
     def generate_fix(
         self,
         primary_file_path: str,
         primary_file_content: str,
         error_log: str,
         screenshot_bytes: bytes | None = None,
+        video_bytes: bytes | None = None,
         context_files: dict[str, str] | None = None,
         repo_file_structure: list[str] | None = None,
         extra_instructions: str | None = None,
         model_name: str | None = None,
     ) -> FixResponse:
         """
-        Sends the broken code, error log, screenshot, and context to Gemini.
+        Sends the broken code, error log, screenshot, video, and context to Gemini.
         
         Args:
             primary_file_path: Path of the broken test file.
             primary_file_content: Content of the broken test file.
             error_log: The CI/CD error log showing what failed.
             screenshot_bytes: PNG screenshot of the UI at failure time (optional).
+            video_bytes: WebM video recording of the test failure (optional).
             context_files: Dictionary of imported file paths to their contents.
             repo_file_structure: List of all file paths in the repository.
             extra_instructions: Additional instructions from user config (optional).
@@ -131,6 +222,8 @@ class GeminiService:
             FixResponse: Structured response with fixes and explanation.
         """
         has_screenshot = screenshot_bytes is not None
+        has_video = video_bytes is not None
+        uploaded_video = None  # Track for cleanup
         # Use provided model or fallback to default
         active_model = model_name
         
@@ -168,11 +261,12 @@ INPUTS:
 2. **IMPORTED DEPENDENCIES**: Files imported by the test (Page Objects, helpers, components).
 3. **ERROR LOG**: The runtime exception from CI/CD.
 4. **SCREENSHOT**: The visual state of the UI at the moment of failure.
-5. **REPOSITORY STRUCTURE**: List of files in the repo to understand the tech stack.
+5. **VIDEO RECORDING**: A video recording of the test execution (if available).
+6. **REPOSITORY STRUCTURE**: List of files in the repo to understand the tech stack.
 
 YOUR ANALYSIS PROTOCOL:
 1. **Analyze the Error FIRST**: 
-   - If "Timeout/Not Found": The element is missing or the selector is wrong. Check the Screenshot.
+   - If "Timeout/Not Found": The element is missing or the selector is wrong. Check the Screenshot/Video.
    - If "Strict Mode Violation" or "Ambiguous": The selector matches multiple elements. Make it more specific.
    - If "Visual/Layout Error": The UI shifted. Adjust assertions.
 
@@ -181,13 +275,21 @@ YOUR ANALYSIS PROTOCOL:
    - Identify unique attributes (data-testid, id, unique class, role with name).
    - NEVER use a selector that could match multiple elements.
 
-3. **Check Context Files**:
+3. **Analyze the Video (TEMPORAL DEBUGGING)**:
+   - If a video is provided, use it to understand timing and animation issues.
+   - Look for: spinners, loading states, animations, button flickers, elements appearing/disappearing.
+   - Check if the test failed due to a race condition (element appeared but test checked too early/late).
+   - Correlate error log timestamps with video frames to pinpoint the exact moment of failure.
+   - If the failure is timing-related, suggest adding waitFor conditions or increasing timeouts.
+
+4. **Check Context Files**:
    - If the test imports Page Objects or helpers, check if selectors are defined there.
    - The fix might need to be in an imported file, not the test itself.
 
-4. **Generate the Fix**:
+5. **Generate the Fix**:
    - Apply standard best practices for stable selectors.
    - Prefer: data-testid > id > unique class > role with name > text with container context.
+   - For timing issues: Add proper waitFor* methods, not arbitrary sleep/timeouts.
    - You may return fixes for MULTIPLE files if needed.
 
 OUTPUT: Return a JSON object with:
@@ -208,18 +310,41 @@ OUTPUT: Return a JSON object with:
                 )
             ]
             
+            # Add video if available (must be uploaded to File API)
+            if has_video:
+                logger.info("🎬 Processing video for temporal debugging...")
+                uploaded_video = self.upload_video(video_bytes, f"failure_{primary_file_path.replace('/', '_')}.webm")
+                if uploaded_video:
+                    user_content.append(types.Part.from_uri(file_uri=uploaded_video.uri, mime_type="video/webm"))
+                    logger.info("🎬 Video attached to analysis")
+                else:
+                    logger.warning("⚠️ Video upload failed, proceeding without video")
+            
             # Add screenshot if available
             if has_screenshot:
                 user_content.append(types.Part.from_bytes(data=screenshot_bytes, mime_type="image/png"))
-                final_instruction = "Analyze the error log and screenshot, then generate robust fix(es). Return JSON."
+            
+            # Build final instruction based on available media
+            media_parts = []
+            if has_screenshot:
+                media_parts.append("screenshot")
+            if uploaded_video:
+                media_parts.append("video recording")
+            
+            if media_parts:
+                final_instruction = f"Analyze the error log, {', and '.join(media_parts)}, then generate robust fix(es). Return JSON."
             else:
-                final_instruction = "Analyze the error log and code, then generate robust fix(es). Return JSON. (Note: No screenshot available for this run)"
+                final_instruction = "Analyze the error log and code, then generate robust fix(es). Return JSON. (Note: No visual media available for this run)"
             
             user_content.append(types.Part.from_text(text=final_instruction))
 
             # Debug: Save the complete prompt for inspection
             debug_prompt = f"{system_instruction}\n\n{'='*80}\nUSER CONTENT:\n{'='*80}\n\n"
             debug_prompt += f"{code_section}{context_section}{structure_section}\n\n--- ERROR LOG ---\n{error_log}\n\n"
+            if uploaded_video:
+                debug_prompt += f"[VIDEO ATTACHED: video/webm - {uploaded_video.name}]\n\n"
+            else:
+                debug_prompt += "[NO VIDEO AVAILABLE]\n\n"
             debug_prompt += "[SCREENSHOT ATTACHED: image/png]\n\n" if has_screenshot else "[NO SCREENSHOT AVAILABLE]\n\n"
             debug_prompt += final_instruction
             self._save_prompt_debug(debug_prompt)
@@ -408,3 +533,9 @@ OUTPUT: Return a JSON object with:
         except Exception as e:
             logger.error(f"❌ Gemini Amendment Generation Failed: {e}")
             raise
+        
+        finally:
+            # Clean up uploaded video file
+            if uploaded_video:
+                logger.info(f"🧹 Cleaning up uploaded video: {uploaded_video.name}")
+                self.delete_file(uploaded_video.name)

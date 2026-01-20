@@ -161,11 +161,17 @@ class WorkflowProcessor:
             model_name = self.config_service.get_model_name(config)
             logger.info(f"🤖 Using AI model: {model_name} (mode: {config.ai.mode})")
             
+            # Log media availability for debugging
+            has_screenshot = evidence["screenshot"] is not None
+            has_video = evidence.get("video") is not None
+            logger.info(f"📎 Media: screenshot={has_screenshot}, video={has_video}")
+            
             fix_result = self.gemini.generate_fix(
                 primary_file_path=broken_file_path,
                 primary_file_content=broken_file_content,
                 error_log=evidence["error_text"],
                 screenshot_bytes=evidence["screenshot"],
+                video_bytes=evidence.get("video"),
                 context_files=context_files,
                 repo_file_structure=repo_files,
                 extra_instructions=config.ai.extra_instructions,
@@ -629,15 +635,15 @@ class WorkflowProcessor:
 
     async def _extract_evidence(self, zip_content: bytes) -> dict:
         """
-        Extract screenshot and error text from the test report ZIP.
+        Extract screenshot, video recording, and error text from the test report ZIP.
         
         Args:
             zip_content: The downloaded artifact ZIP bytes.
         
         Returns:
-            dict: Contains 'screenshot' (bytes) and 'error_text' (str).
+            dict: Contains 'screenshot' (bytes), 'video' (bytes), and 'error_text' (str).
         """
-        evidence = {"screenshot": None, "error_text": ""}
+        evidence = {"screenshot": None, "video": None, "error_text": ""}
         
         try:
             with zipfile.ZipFile(io.BytesIO(zip_content)) as z:
@@ -654,6 +660,18 @@ class WorkflowProcessor:
                     os.makedirs("debug_screenshots", exist_ok=True)
                     with open(f"debug_screenshots/{os.path.basename(screenshot_file)}", "wb") as f:
                         f.write(evidence["screenshot"])
+
+                # Find video recording (.webm files from Playwright)
+                video_file = next((f for f in file_list if f.endswith(".webm")), None)
+                if video_file:
+                    logger.info(f"🎬 Found video recording: {video_file}")
+                    evidence["video"] = z.read(video_file)
+                    
+                    # Save for debugging
+                    os.makedirs("debug_videos", exist_ok=True)
+                    with open(f"debug_videos/{os.path.basename(video_file)}", "wb") as f:
+                        f.write(evidence["video"])
+                    logger.info(f"🎬 Video size: {len(evidence['video']):,} bytes")
 
                 # Find error text - prioritize .md and .txt files
                 error_files = [f for f in file_list if f.endswith(('.md', '.txt', '.log'))]
