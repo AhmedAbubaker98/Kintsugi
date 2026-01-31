@@ -62,6 +62,13 @@ class Settings(BaseSettings):
         json_schema_extra={"env": "GEMINI_API_KEY"},
     )
     
+    # Demo/Hackathon Mode - Password protection
+    judge_password: SecretStr = Field(
+        default=SecretStr(""),
+        description="Master password to activate the app during hackathon/demo period",
+        json_schema_extra={"env": "JUDGE_PASSWORD"},
+    )
+    
     # Server Configuration
     api_host: str = Field(default="0.0.0.0", description="API server host")
     api_port: int = Field(default=8000, description="API server port")

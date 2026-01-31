@@ -57,6 +57,7 @@ class KintsugiConfig(BaseModel):
     Example .github/kintsugi.yml:
     ```yaml
     version: 1
+    demo_password: "your-password-here"  # Required during hackathon demo period
     branches:
       allow: ["main", "develop"]
       ignore: ["dependabot/**"]
@@ -73,6 +74,10 @@ class KintsugiConfig(BaseModel):
     ```
     """
     version: int = 1
+    demo_password: Optional[str] = Field(
+        default=None,
+        description="Required for activating the app during the hackathon demo period."
+    )
     branches: BranchConfig = Field(default_factory=BranchConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)

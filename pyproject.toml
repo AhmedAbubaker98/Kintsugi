@@ -1,18 +1,17 @@
 [project]
 name = "Kintsugi"
 version = "0.1.0"
-description = "The Autonomous QA Orchestrator for Playwright & Cypress"
+description = "Self-Healing E2E Test Automation for Playwright & Cypress"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = {text = "CC-BY-NC-4.0"}
 authors = [
     {name = "Kintsugi Team"}
 ]
-keywords = ["github-app", "e2e-testing", "playwright", "cypress", "ai", "automation"]
+keywords = ["github-app", "e2e-testing", "playwright", "cypress", "gemini", "ai", "automation", "self-healing"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

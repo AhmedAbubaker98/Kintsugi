@@ -350,37 +350,38 @@ INPUTS:
 
 YOUR ANALYSIS PROTOCOL:
 1. **Analyze the Error FIRST**: 
-   - If "Timeout/Not Found": The element is missing or the selector is wrong. Check the Screenshot/Video/DOM.
-   - If "Strict Mode Violation" or "Ambiguous": The selector matches multiple elements. Make it more specific.
-   - If "Visual/Layout Error": The UI shifted. Adjust assertions.
+   - Categorize the error type (timeout, assertion, strict mode, network, authentication, etc.).
+   - Identify the root cause: Is it a selector issue, timing issue, test logic error, environmental, etc.?
+   - Extract key information: element names, expected vs actual values, stack trace locations.
 
 2. **Analyze the Screenshot**: 
-   - Compare the visual reality to the code's expectation.
-   - Identify unique attributes (data-testid, id, unique class, role with name).
-   - NEVER use a selector that could match multiple elements.
+   - Compare the visual state to what the test expects.
+   - Identify available element identifiers visible in the UI.
+   - Look for unexpected states: modals, overlays, empty states, error messages.
 
 3. **Analyze the Video (TEMPORAL DEBUGGING)**:
-   - If a video is provided, use it to understand timing and animation issues.
-   - Look for: spinners, loading states, animations, button flickers, elements appearing/disappearing.
-   - Check if the test failed due to a race condition (element appeared but test checked too early/late).
-   - Correlate error log timestamps with video frames to pinpoint the exact moment of failure.
-   - If the failure is timing-related, suggest adding waitFor conditions or increasing timeouts.
+   - If a video is provided, observe the full sequence of events leading to failure.
+   - Identify any timing issues: async operations, animations, state transitions, network delays.
+   - Correlate error log timestamps with video frames to pinpoint the exact failure moment.
+   - Determine if the failure is deterministic or related to race conditions.
 
 4. **Analyze the DOM Snapshot (STRUCTURAL DEBUGGING)**:
-   - If a DOM snapshot is provided, search for the actual element attributes.
-   - Find exact data-testid, id, class names, and ARIA attributes that exist in the DOM.
-   - Identify parent-child relationships that can help create more specific selectors.
-   - Check if the expected element exists but has different attributes than the test expects.
+   - If a DOM snapshot is provided, examine the actual page structure.
+   - Compare expected selectors/attributes with what actually exists in the DOM.
+   - Identify element hierarchy, available attributes, and potential selector alternatives.
+   - Check for dynamically generated IDs, conditional rendering, or shadow DOM boundaries.
 
 5. **Check Context Files**:
-   - If the test imports Page Objects or helpers, check if selectors are defined there.
-   - The fix might need to be in an imported file, not the test itself.
+   - Examine imported Page Objects, utilities, and helper files.
+   - The root cause might be in shared code, not the test file itself.
+   - Look for hardcoded values, outdated selectors, or incorrect abstractions.
 
 6. **Generate the Fix**:
-   - Apply standard best practices for stable selectors.
-   - Prefer: data-testid > id > unique class > role with name > text with container context.
-   - For timing issues: Add proper waitFor* methods, not arbitrary sleep/timeouts.
-   - You may return fixes for MULTIPLE files if needed.
+   - Address the actual root cause, not just symptoms.
+   - Follow testing best practices for the identified framework.
+   - For selector issues: prefer stable, semantic selectors over brittle ones.
+   - For timing issues: use proper wait mechanisms, not arbitrary delays.
+   - You may return fixes for MULTIPLE files if the issue spans across files.
 
 OUTPUT: Return a JSON object with:
 - "thought_process": Your detailed internal monologue showing step-by-step technical reasoning. Document what you observed in each evidence source (error log, screenshot, video, DOM) and how it led to your diagnosis.

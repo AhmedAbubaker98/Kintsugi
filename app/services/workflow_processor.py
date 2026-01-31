@@ -133,7 +133,19 @@ class WorkflowProcessor:
             config_ref = branch if not branch.startswith("kintsugi-fix") else "main"
             config = await self.config_service.get_config(installation_id, owner, repo, ref=config_ref)
             
-            # 3. Check if this is an iteration on an existing kintsugi branch
+            # 3. DEMO PASSWORD VALIDATION (Hackathon protection)
+            from app.core.config import settings
+            expected_password = settings.judge_password.get_secret_value()
+            if expected_password:  # Only validate if server has a password set
+                if config.demo_password != expected_password:
+                    logger.warning(
+                        f"🚫 Invalid or missing demo_password for {repo_full_name}. "
+                        "Kintsugi is currently in a restricted demo mode."
+                    )
+                    return
+                logger.info(f"✅ Demo password validated for {repo_full_name}. Proceeding.")
+            
+            # 4. Check if this is an iteration on an existing kintsugi branch
             is_iteration = branch.startswith("kintsugi-fix")
             
             if is_iteration:
@@ -158,7 +170,7 @@ class WorkflowProcessor:
                     logger.info(f"⏭️ Branch '{branch}' is not in allowed list. Skipping.")
                     return
 
-            # 4. Download Artifacts (if available)
+            # 5. Download Artifacts (if available)
             artifacts = await self._get_artifacts_with_retry(token, repo_full_name, run_id)
             
             # Initialize evidence with defaults
@@ -189,7 +201,7 @@ class WorkflowProcessor:
             else:
                 logger.warning(f"No artifacts found for run {run_id}. Will attempt to continue with defaults.")
             
-            # 5. Get repository file structure for context
+            # 6. Get repository file structure for context
             fetch_branch = branch
             repo_files = await self.github.list_repository_files(token, repo_full_name, ref=fetch_branch)
             logger.info(f"📂 Repository has {len(repo_files)} files")
@@ -205,7 +217,7 @@ class WorkflowProcessor:
             
             logger.info(f"🎯 Identified broken file: {broken_file_path}")
 
-            # 6. Fetch the broken file content
+            # 7. Fetch the broken file content
             file_data = await self.github.get_repository_content(
                 installation_id, owner, repo, broken_file_path, ref=fetch_branch
             )
@@ -227,20 +239,20 @@ class WorkflowProcessor:
 
             broken_file_content = base64.b64decode(file_data["content"]).decode("utf-8")
 
-            # 7. Smart Context Retrieval - Parse imports and fetch related files
+            # 8. Smart Context Retrieval - Parse imports and fetch related files
             context_files = await self._fetch_context_files(
                 installation_id, owner, repo, fetch_branch,
                 broken_file_path, broken_file_content, repo_files
             )
             logger.info(f"📚 Fetched {len(context_files)} context files")
 
-            # 8. Determine target branch for session tracking
+            # 9. Determine target branch for session tracking
             if is_iteration:
                 session_id = branch  # Reuse existing kintsugi branch name
             else:
                 session_id = f"kintsugi-fix-{int(time.time())}"  # New branch name
             
-            # 9. Call Gemini with full context (using Chat API for thought signature continuity)
+            # 10. Call Gemini with full context (using Chat API for thought signature continuity)
             logger.info("🧠 Sending to Gemini with full context...")
             
             model_name = self.config_service.get_model_name(config)
@@ -270,7 +282,7 @@ class WorkflowProcessor:
             logger.info(f"📝 {fix_result.explanation}")
             logger.info(f"📄 {len(fix_result.fixes)} file(s) to update")
 
-            # 10. Validate fixes against config limits
+            # 11. Validate fixes against config limits
             if len(fix_result.fixes) > config.limits.max_files_changed:
                 logger.warning(
                     f"⚠️ Gemini suggested {len(fix_result.fixes)} files, "
@@ -278,7 +290,7 @@ class WorkflowProcessor:
                 )
                 fix_result.fixes = fix_result.fixes[:config.limits.max_files_changed]
 
-            # 11. Check for protected files
+            # 12. Check for protected files
             protected_fixes = []
             allowed_fixes = []
             for fix in fix_result.fixes:
@@ -298,13 +310,13 @@ class WorkflowProcessor:
             if protected_fixes:
                 logger.info(f"⏭️ Skipping protected files: {protected_fixes}")
 
-            # 12. Security scan - check LLM-generated code for vulnerabilities
+            # 13. Security scan - check LLM-generated code for vulnerabilities
             security_passed, allowed_fixes = await self._security_scan_fixes(allowed_fixes, config)
             if not allowed_fixes:
                 logger.error("❌ All fixes blocked by security scan. Aborting.")
                 return
 
-            # 13. Determine branch strategy (create or reuse)
+            # 14. Determine branch strategy (create or reuse)
             if is_iteration:
                 # Reuse existing kintsugi branch
                 target_branch = session_id
@@ -320,7 +332,7 @@ class WorkflowProcessor:
                 await self.github.create_branch(token, repo_full_name, target_branch, branch_sha)
                 logger.info(f"✅ Branch '{target_branch}' created")
 
-            # 14. Build and save metadata FIRST (before applying fixes)
+            # 15. Build and save metadata FIRST (before applying fixes)
             current_attempt = await self.github.get_branch_commit_count(
                 token, repo_full_name, target_branch, base_branch
             ) + 1 if is_iteration else 1
@@ -331,20 +343,20 @@ class WorkflowProcessor:
                 run_id, broken_file_path, evidence, fix_result, current_attempt
             )
             
-            # 15. Apply allowed fixes (silently)
+            # 16. Apply allowed fixes (silently)
             for fix in allowed_fixes:
                 await self._apply_fix(
                     token, installation_id, owner, repo, repo_full_name,
                     target_branch, fix.file_path, fix.content, fix_result.explanation
                 )
             
-            # 16. Save/update metadata file in branch
+            # 17. Save/update metadata file in branch
             await self._save_metadata(
                 token, installation_id, owner, repo, repo_full_name,
                 target_branch, metadata
             )
 
-            # 17. NO PR CREATION! Just log and wait for CI result
+            # 18. NO PR CREATION! Just log and wait for CI result
             logger.info(f"Fix pushed to '{target_branch}'. Waiting for CI...")
             logger.info(f"Attempt {current_attempt}/{config.limits.max_attempts}")
 
@@ -1408,7 +1420,18 @@ This likely indicates a more complex issue that requires human review.
             # 2. Load config
             config = await self.config_service.get_config(installation_id, owner, repo, ref=base_branch)
             
-            # 3. Get files changed by Kintsugi in this PR
+            # 3. DEMO PASSWORD VALIDATION (Hackathon protection)
+            from app.core.config import settings
+            expected_password = settings.judge_password.get_secret_value()
+            if expected_password:  # Only validate if server has a password set
+                if config.demo_password != expected_password:
+                    logger.warning(
+                        f"🚫 Invalid or missing demo_password for {repo_full_name}. "
+                        "Kintsugi is currently in a restricted demo mode."
+                    )
+                    return
+            
+            # 4. Get files changed by Kintsugi in this PR
             changed_files = await self._get_pr_changed_files(token, repo_full_name, pr_number)
             if not changed_files:
                 logger.warning("Could not find any changed files in this PR")
@@ -1416,14 +1439,14 @@ This likely indicates a more complex issue that requires human review.
             
             logger.info(f"📄 PR has {len(changed_files)} changed file(s): {list(changed_files.keys())}")
             
-            # 4. Get repository file structure
+            # 5. Get repository file structure
             repo_files = await self.github.list_repository_files(token, repo_full_name, ref=head_branch)
             
-            # 5. Parse comment for mentioned file paths
+            # 6. Parse comment for mentioned file paths
             mentioned_files = self._parse_file_mentions(comment_body, repo_files)
             logger.info(f"📝 Files mentioned in comment: {mentioned_files}")
             
-            # 6. Fetch context files (imports from changed files + mentioned files)
+            # 7. Fetch context files (imports from changed files + mentioned files)
             context_files = {}
             for file_path, content in changed_files.items():
                 file_context = await self._fetch_context_files(
@@ -1443,7 +1466,7 @@ This likely indicates a more complex issue that requires human review.
             
             logger.info(f"📚 Fetched {len(context_files)} context files")
             
-            # 7. Get AI model from config
+            # 8. Get AI model from config
             model_name = self.config_service.get_model_name(config)
             
             # 8. Call Gemini to generate amendments (using Chat API for conversation continuity)
@@ -1462,11 +1485,11 @@ This likely indicates a more complex issue that requires human review.
             
             logger.info(f"✨ Gemini generated {len(amendment_result.fixes)} amendment(s)")
             
-            # 9. Security scan amendments before applying
+            # 10. Security scan amendments before applying
             if amendment_result.fixes:
                 _, safe_fixes = await self._security_scan_fixes(amendment_result.fixes, config)
                 
-                # 10. Apply the safe amendments (commit to the same branch)
+                # 11. Apply the safe amendments (commit to the same branch)
                 for fix in safe_fixes:
                     # Check protected paths
                     if self.config_service.is_path_protected(config, fix.file_path):
@@ -1479,7 +1502,7 @@ This likely indicates a more complex issue that requires human review.
                         f"Kintsugi amendment per @{comment_author}'s feedback"
                     )
             
-            # 11. Post reply comment
+            # 12. Post reply comment
             reply_body = f"{amendment_result.reply}\n\n---\n*🤖 Kintsugi - Self-Healing Test Bot*"
             await self.github.create_pr_comment(
                 installation_id=installation_id,
