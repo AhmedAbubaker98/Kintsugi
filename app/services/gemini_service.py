@@ -8,6 +8,10 @@ Uses structured JSON output for reliable parsing.
 Supports multimodal analysis including:
 - Screenshots (PNG) - inline as image parts
 - Video recordings (WebM) - uploaded via File API with polling
+
+Uses Chat API (not stateless generate_content) to properly
+handle Gemini 3's thought signatures for multi-turn conversations.
+The SDK automatically preserves thought signatures when using chats.
 """
 
 import asyncio
@@ -15,6 +19,7 @@ import logging
 import os
 import time
 from datetime import datetime
+from typing import Optional
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -32,6 +37,9 @@ class FileFix(BaseModel):
 class FixResponse(BaseModel):
     """Structured response from Gemini containing fixes and explanation."""
     
+    thought_process: str = Field(
+        description="Your internal monologue: Step-by-step technical reasoning used to diagnose the failure and arrive at the fix. Include what you observed in each evidence source (error log, screenshot, video, DOM) and how it informed your solution."
+    )
     fixes: list[FileFix] = Field(
         description="List of file fixes to apply. Usually just the broken test file, but may include imported files if they need changes."
     )
@@ -60,6 +68,9 @@ class GeminiService:
     
     Supports video analysis via File API for temporal debugging
     (timing issues, animations, spinners, button flickers).
+    
+    Uses Chat API to properly handle Gemini 3's thought signatures.
+    The SDK automatically manages thought signature preservation across turns.
     """
     
     # Video upload polling settings
@@ -73,6 +84,10 @@ class GeminiService:
         self.output_dir = "debug_outputs"
         os.makedirs(self.debug_dir, exist_ok=True)
         os.makedirs(self.output_dir, exist_ok=True)
+        
+        # Store active chat sessions for multi-turn conversations
+        # Key: session_id (e.g., branch name), Value: Chat object
+        self._chat_sessions: dict[str, any] = {}
 
     def _rotate_debug_file(self, directory: str, prefix: str, content: str):
         """
@@ -115,6 +130,61 @@ class GeminiService:
         Rotates: output_1.txt (newest) -> output_2.txt -> output_3.txt (oldest)
         """
         self._rotate_debug_file(self.output_dir, "gemini_output", output_content)
+
+    def _log_token_usage(self, response, model_name: str, operation: str = "generation"):
+        """
+        Log token usage and estimated cost from Gemini response.
+        
+        Pricing (as of Jan 2026, per 1M tokens):
+        - gemini-2.0-flash: $0.075 input / $0.30 output
+        - gemini-2.0-pro: $1.25 input / $5.00 output
+        - gemini-3-pro: $1.25 input / $10.00 output (estimated)
+        - gemini-3-flash: $0.10 input / $0.40 output (estimated)
+        
+        Args:
+            response: The Gemini API response containing usage_metadata.
+            model_name: The model name used for pricing calculation.
+            operation: Description of the operation (for logging).
+        """
+        try:
+            usage = response.usage_metadata
+            if not usage:
+                logger.debug(f"💰 No usage metadata available for {operation}")
+                return
+            
+            prompt_tokens = getattr(usage, 'prompt_token_count', 0) or 0
+            output_tokens = getattr(usage, 'candidates_token_count', 0) or 0
+            total_tokens = getattr(usage, 'total_token_count', 0) or (prompt_tokens + output_tokens)
+            
+            # Pricing per 1M tokens (estimate for latest models)
+            pricing = {
+                "gemini-2.0-flash": {"input": 0.075, "output": 0.30},
+                "gemini-2.0-pro": {"input": 1.25, "output": 5.00},
+                "gemini-3-pro": {"input": 1.25, "output": 10.00},
+                "gemini-3-flash": {"input": 0.10, "output": 0.40},
+                "gemini-3-pro-preview": {"input": 1.25, "output": 10.00},
+            }
+            
+            # Find matching pricing (default to flash pricing if unknown)
+            model_pricing = pricing.get("gemini-2.0-flash")  # default
+            for key, prices in pricing.items():
+                if key in model_name.lower():
+                    model_pricing = prices
+                    break
+            
+            # Calculate estimated cost (pricing is per 1M tokens)
+            input_cost = (prompt_tokens / 1_000_000) * model_pricing["input"]
+            output_cost = (output_tokens / 1_000_000) * model_pricing["output"]
+            total_cost = input_cost + output_cost
+            
+            logger.info(
+                f"💰 Token Usage [{operation}]: "
+                f"input={prompt_tokens:,} | output={output_tokens:,} | total={total_tokens:,} | "
+                f"est. cost=${total_cost:.4f} (in: ${input_cost:.4f}, out: ${output_cost:.4f})"
+            )
+            
+        except Exception as e:
+            logger.debug(f"Could not log token usage: {e}")
 
     def upload_video(self, video_bytes: bytes, filename: str = "recording.webm") -> types.File | None:
         """
@@ -203,9 +273,14 @@ class GeminiService:
         repo_file_structure: list[str] | None = None,
         extra_instructions: str | None = None,
         model_name: str | None = None,
+        session_id: str | None = None,
+        is_iteration: bool = False,
     ) -> FixResponse:
         """
         Sends the broken code, error log, screenshot, video, and context to Gemini.
+        
+        Uses Chat API to properly handle thought signatures for multi-turn
+        conversations (iterations). The SDK automatically preserves signatures.
         
         Args:
             primary_file_path: Path of the broken test file.
@@ -217,6 +292,9 @@ class GeminiService:
             repo_file_structure: List of all file paths in the repository.
             extra_instructions: Additional instructions from user config (optional).
             model_name: Override the default model name (optional).
+            session_id: Unique ID for this fix session (e.g., branch name). 
+                        Used to maintain chat history across iterations.
+            is_iteration: If True, this is a follow-up attempt on an existing session.
         
         Returns:
             FixResponse: Structured response with fixes and explanation.
@@ -224,11 +302,16 @@ class GeminiService:
         has_screenshot = screenshot_bytes is not None
         has_video = video_bytes is not None
         uploaded_video = None  # Track for cleanup
-        # Use provided model or fallback to default
         active_model = model_name
         
         try:
             logger.info(f"🧠 Gemini ({active_model}) is thinking...")
+            
+            # Determine if we should use existing chat or create new one
+            chat = None
+            if session_id and is_iteration and session_id in self._chat_sessions:
+                chat = self._chat_sessions[session_id]
+                logger.info(f"🔄 Continuing existing chat session: {session_id}")
 
             # Build context sections
             context_files = context_files or {}
@@ -262,11 +345,12 @@ INPUTS:
 3. **ERROR LOG**: The runtime exception from CI/CD.
 4. **SCREENSHOT**: The visual state of the UI at the moment of failure.
 5. **VIDEO RECORDING**: A video recording of the test execution (if available).
-6. **REPOSITORY STRUCTURE**: List of files in the repo to understand the tech stack.
+6. **DOM SNAPSHOT**: The HTML structure of the page at failure time (if available).
+7. **REPOSITORY STRUCTURE**: List of files in the repo to understand the tech stack.
 
 YOUR ANALYSIS PROTOCOL:
 1. **Analyze the Error FIRST**: 
-   - If "Timeout/Not Found": The element is missing or the selector is wrong. Check the Screenshot/Video.
+   - If "Timeout/Not Found": The element is missing or the selector is wrong. Check the Screenshot/Video/DOM.
    - If "Strict Mode Violation" or "Ambiguous": The selector matches multiple elements. Make it more specific.
    - If "Visual/Layout Error": The UI shifted. Adjust assertions.
 
@@ -282,19 +366,26 @@ YOUR ANALYSIS PROTOCOL:
    - Correlate error log timestamps with video frames to pinpoint the exact moment of failure.
    - If the failure is timing-related, suggest adding waitFor conditions or increasing timeouts.
 
-4. **Check Context Files**:
+4. **Analyze the DOM Snapshot (STRUCTURAL DEBUGGING)**:
+   - If a DOM snapshot is provided, search for the actual element attributes.
+   - Find exact data-testid, id, class names, and ARIA attributes that exist in the DOM.
+   - Identify parent-child relationships that can help create more specific selectors.
+   - Check if the expected element exists but has different attributes than the test expects.
+
+5. **Check Context Files**:
    - If the test imports Page Objects or helpers, check if selectors are defined there.
    - The fix might need to be in an imported file, not the test itself.
 
-5. **Generate the Fix**:
+6. **Generate the Fix**:
    - Apply standard best practices for stable selectors.
    - Prefer: data-testid > id > unique class > role with name > text with container context.
    - For timing issues: Add proper waitFor* methods, not arbitrary sleep/timeouts.
    - You may return fixes for MULTIPLE files if needed.
 
 OUTPUT: Return a JSON object with:
+- "thought_process": Your detailed internal monologue showing step-by-step technical reasoning. Document what you observed in each evidence source (error log, screenshot, video, DOM) and how it led to your diagnosis.
 - "fixes": Array of {{"file_path": "path/to/file", "content": "full corrected content"}}
-- "explanation": Brief summary of what was wrong and how you fixed it
+- "explanation": Brief summary of what was wrong and how you fixed it (2-3 sentences for PR description)
 """
             # Add extra instructions from user config if provided
             if extra_instructions:
@@ -324,22 +415,38 @@ OUTPUT: Return a JSON object with:
             if has_screenshot:
                 user_content.append(types.Part.from_bytes(data=screenshot_bytes, mime_type="image/png"))
             
-            # Build final instruction based on available media
+            # Build final instruction based on available media and iteration status
             media_parts = []
             if has_screenshot:
                 media_parts.append("screenshot")
             if uploaded_video:
                 media_parts.append("video recording")
             
-            if media_parts:
-                final_instruction = f"Analyze the error log, {', and '.join(media_parts)}, then generate robust fix(es). Return JSON."
+            if is_iteration:
+                # For iterations, remind the model about previous attempt
+                if media_parts:
+                    final_instruction = (
+                        f"⚠️ ITERATION: The previous fix did NOT work. Here is the NEW error after your last attempt.\n\n"
+                        f"Analyze the NEW error log, {', and '.join(media_parts)}, and generate a DIFFERENT fix. "
+                        f"Your previous approach failed - try something else. Return JSON."
+                    )
+                else:
+                    final_instruction = (
+                        f"⚠️ ITERATION: The previous fix did NOT work. Here is the NEW error after your last attempt.\n\n"
+                        f"Analyze the NEW error log and code, and generate a DIFFERENT fix. "
+                        f"Your previous approach failed - try something else. Return JSON."
+                    )
             else:
-                final_instruction = "Analyze the error log and code, then generate robust fix(es). Return JSON. (Note: No visual media available for this run)"
+                if media_parts:
+                    final_instruction = f"Analyze the error log, {', and '.join(media_parts)}, then generate robust fix(es). Return JSON."
+                else:
+                    final_instruction = "Analyze the error log and code, then generate robust fix(es). Return JSON. (Note: No visual media available for this run)"
             
             user_content.append(types.Part.from_text(text=final_instruction))
 
             # Debug: Save the complete prompt for inspection
             debug_prompt = f"{system_instruction}\n\n{'='*80}\nUSER CONTENT:\n{'='*80}\n\n"
+            debug_prompt += f"[ITERATION: {is_iteration}]\n\n"
             debug_prompt += f"{code_section}{context_section}{structure_section}\n\n--- ERROR LOG ---\n{error_log}\n\n"
             if uploaded_video:
                 debug_prompt += f"[VIDEO ATTACHED: video/webm - {uploaded_video.name}]\n\n"
@@ -357,23 +464,30 @@ OUTPUT: Return a JSON object with:
                 response_schema=FixResponse,
             )
 
-            # 4. Generate
-            response = self.client.models.generate_content(
-                model=active_model,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=user_content
-                    )
-                ],
-                config=config
-            )
+            # 4. Generate using Chat API (handles thought signatures automatically)
+            if chat is None:
+                # Create new chat session
+                chat = self.client.chats.create(
+                    model=active_model,
+                    config=config,
+                )
+                if session_id:
+                    self._chat_sessions[session_id] = chat
+                    logger.info(f"📝 Created new chat session: {session_id}")
+            
+            # Send message via chat (SDK preserves thought signatures automatically)
+            response = chat.send_message(user_content)
 
             # 5. Parse the structured response
             result = FixResponse.model_validate_json(response.text)
             
+            # Log token usage and estimated cost
+            self._log_token_usage(response, active_model, "fix_generation")
+            
             # Debug: Save the output for inspection
-            output_debug = f"MODEL: {active_model}\n\nRAW RESPONSE:\n{response.text}\n\n{'='*80}\nPARSED RESULT:\n{'='*80}\n\n"
+            output_debug = f"MODEL: {active_model}\n\nSESSION: {session_id}\nITERATION: {is_iteration}\n\n"
+            output_debug += f"RAW RESPONSE:\n{response.text}\n\n{'='*80}\nPARSED RESULT:\n{'='*80}\n\n"
+            output_debug += f"Thought process:\n{result.thought_process}\n\n"
             output_debug += f"Explanation: {result.explanation}\n\n"
             output_debug += f"Fixes ({len(result.fixes)} file(s)):\n"
             for fix in result.fixes:
@@ -388,6 +502,40 @@ OUTPUT: Return a JSON object with:
         except Exception as e:
             logger.error(f"❌ Gemini Generation Failed: {e}")
             raise
+        
+        finally:
+            # Clean up uploaded video file
+            if uploaded_video:
+                logger.info(f"🧹 Cleaning up uploaded video: {uploaded_video.name}")
+                self.delete_file(uploaded_video.name)
+
+    def clear_session(self, session_id: str) -> bool:
+        """
+        Clear a chat session when the fix is complete (success or max attempts).
+        Also clears any associated amendment sessions.
+        
+        Args:
+            session_id: The session ID to clear (typically the branch name).
+        
+        Returns:
+            bool: True if any session was cleared, False if none found.
+        """
+        cleared = False
+        
+        # Clear main fix session
+        if session_id in self._chat_sessions:
+            del self._chat_sessions[session_id]
+            logger.info(f"🗑️ Cleared fix chat session: {session_id}")
+            cleared = True
+        
+        # Clear amendment session if exists
+        amendment_key = f"amendment:{session_id}"
+        if amendment_key in self._chat_sessions:
+            del self._chat_sessions[amendment_key]
+            logger.info(f"🗑️ Cleared amendment chat session: {amendment_key}")
+            cleared = True
+        
+        return cleared
 
     def generate_amendment(
         self,
@@ -399,9 +547,11 @@ OUTPUT: Return a JSON object with:
         repo_file_structure: list[str] | None = None,
         extra_instructions: str | None = None,
         model_name: str | None = None,
+        session_id: str | None = None,
     ) -> AmendmentResponse:
         """
         Process a user's comment/feedback and generate amendments to the fix.
+        Uses Chat API to maintain conversation context if multiple amendments are requested.
         
         Args:
             comment_body: The user's comment text mentioning @kintsugi.
@@ -412,6 +562,7 @@ OUTPUT: Return a JSON object with:
             repo_file_structure: List of all file paths in the repository.
             extra_instructions: Additional instructions from user config (optional).
             model_name: Override the default model name (optional).
+            session_id: Unique identifier for this amendment conversation (branch name).
         
         Returns:
             AmendmentResponse: Structured response with fixes and a reply message.
@@ -503,23 +654,31 @@ OUTPUT: Return a JSON object with:
                 response_schema=AmendmentResponse,
             )
             
-            # Generate
-            response = self.client.models.generate_content(
-                model=active_model,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=user_content
-                    )
-                ],
-                config=config
-            )
+            # Generate using Chat API for conversation continuity
+            amendment_session_key = f"amendment:{session_id}" if session_id else None
+            chat = self._chat_sessions.get(amendment_session_key) if amendment_session_key else None
+            
+            if chat is None:
+                # Create new chat session for amendments
+                chat = self.client.chats.create(
+                    model=active_model,
+                    config=config,
+                )
+                if amendment_session_key:
+                    self._chat_sessions[amendment_session_key] = chat
+                    logger.info(f"📝 Created new amendment chat session: {amendment_session_key}")
+            
+            # Send message via chat
+            response = chat.send_message(user_content)
             
             # Parse the structured response
             result = AmendmentResponse.model_validate_json(response.text)
             
+            # Log token usage and estimated cost
+            self._log_token_usage(response, active_model, "amendment")
+            
             # Debug: Save the output
-            output_debug = f"MODEL: {active_model}\n\nRAW RESPONSE:\n{response.text}\n\n{'='*80}\nPARSED RESULT:\n{'='*80}\n\n"
+            output_debug = f"MODEL: {active_model}\n\nSESSION: {amendment_session_key}\n\nRAW RESPONSE:\n{response.text}\n\n{'='*80}\nPARSED RESULT:\n{'='*80}\n\n"
             output_debug += f"Reply: {result.reply}\n\n"
             output_debug += f"Fixes ({len(result.fixes)} file(s)):\n"
             for fix in result.fixes:
@@ -533,9 +692,3 @@ OUTPUT: Return a JSON object with:
         except Exception as e:
             logger.error(f"❌ Gemini Amendment Generation Failed: {e}")
             raise
-        
-        finally:
-            # Clean up uploaded video file
-            if uploaded_video:
-                logger.info(f"🧹 Cleaning up uploaded video: {uploaded_video.name}")
-                self.delete_file(uploaded_video.name)

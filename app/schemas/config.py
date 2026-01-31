@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 class BranchConfig(BaseModel):
     """Branch filtering configuration."""
-    allow: List[str] = Field(default=["main", "master", "develop", "feature/*"])
+    allow: List[str] = Field(default=["main", "master", "develop", "feature/*", "kintsugi-fix*"])
     ignore: List[str] = Field(default=["dependabot/**"])
 
 
@@ -34,6 +34,9 @@ class SecurityConfig(BaseModel):
             "*.lock",
         ]
     )
+    # Security scanning for LLM-generated code
+    scan_enabled: bool = Field(default=True, description="Enable Semgrep security scanning")
+    block_on_critical: bool = Field(default=True, description="Block commits with critical security issues")
 
 
 class AIConfig(BaseModel):

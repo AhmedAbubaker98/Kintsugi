@@ -702,3 +702,82 @@ class GitHubService:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, headers=headers)
             return response.status_code == 200
+
+    async def get_commits_on_branch(
+        self,
+        token: str,
+        repo_full_name: str,
+        branch: str,
+        base_branch: str = "main",
+    ) -> list[dict]:
+        """
+        Get commits on a branch that are not on the base branch.
+        
+        Args:
+            token: Installation access token.
+            repo_full_name: Full repository name (owner/repo).
+            branch: The branch to get commits from.
+            base_branch: The base branch to compare against.
+        
+        Returns:
+            list[dict]: List of commit objects with sha, message, author, etc.
+        """
+        url = f"{self.base_url}/repos/{repo_full_name}/compare/{base_branch}...{branch}"
+        headers = self._install_headers(token)
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 404:
+                logger.warning(f"Could not compare {base_branch}...{branch}")
+                return []
+            response.raise_for_status()
+            data = response.json()
+            return data.get("commits", [])
+
+    async def get_branch_commit_count(
+        self,
+        token: str,
+        repo_full_name: str,
+        branch: str,
+        base_branch: str = "main",
+    ) -> int:
+        """
+        Count commits on a branch ahead of the base branch.
+        
+        Args:
+            token: Installation access token.
+            repo_full_name: Full repository name (owner/repo).
+            branch: The branch to count commits on.
+            base_branch: The base branch to compare against.
+        
+        Returns:
+            int: Number of commits ahead of base branch.
+        """
+        commits = await self.get_commits_on_branch(token, repo_full_name, branch, base_branch)
+        return len(commits)
+
+    async def get_latest_commit_message(
+        self,
+        token: str,
+        repo_full_name: str,
+        branch: str,
+    ) -> str:
+        """
+        Get the latest commit message on a branch.
+        
+        Args:
+            token: Installation access token.
+            repo_full_name: Full repository name (owner/repo).
+            branch: The branch to get the commit from.
+        
+        Returns:
+            str: The commit message.
+        """
+        url = f"{self.base_url}/repos/{repo_full_name}/commits/{branch}"
+        headers = self._install_headers(token)
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("commit", {}).get("message", "")

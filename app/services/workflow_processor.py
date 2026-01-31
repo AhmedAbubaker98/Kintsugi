@@ -6,13 +6,63 @@ import asyncio
 import base64
 import time
 import re
+import json
+from datetime import datetime
 from pathlib import PurePosixPath
+from typing import Optional
+from pydantic import BaseModel, Field
 from app.services.github_service import GitHubService
-from app.services.gemini_service import GeminiService
+from app.services.gemini_service import GeminiService, FixResponse
 from app.services.config_service import ConfigService
+from app.services.security_scanner import SecurityScanner, ScanResult
 from app.schemas.config import KintsugiConfig
 
 logger = logging.getLogger(__name__)
+
+# Kintsugi metadata file stored in the fix branch
+KINTSUGI_METADATA_FILE = ".kintsugi/fix_metadata.json"
+
+
+class EvidenceUsed(BaseModel):
+    """Track which evidence sources were available."""
+    screenshot: bool = False
+    video: bool = False
+    dom_snapshot: bool = False
+    error_log: bool = True  # Always have this
+
+
+class AttemptRecord(BaseModel):
+    """Record of a single fix attempt."""
+    attempt_number: int
+    timestamp: str
+    error_summary: str = ""  # Brief summary of the error that triggered this attempt
+    files_changed: list[str] = Field(default_factory=list)
+
+
+class KintsugiFixMetadata(BaseModel):
+    """
+    Metadata about the fix process, stored in the branch.
+    This allows us to build a high-fidelity PR report on success.
+    """
+    # Origin info
+    base_branch: str
+    original_run_id: int
+    primary_file: str
+    
+    # Evidence tracking
+    evidence_used: EvidenceUsed = Field(default_factory=EvidenceUsed)
+    
+    # AI reasoning (from the latest successful analysis)
+    thought_process: str = ""
+    explanation: str = ""
+    
+    # Attempt history
+    attempts: list[AttemptRecord] = Field(default_factory=list)
+    
+    # Timestamps
+    started_at: str = ""
+    last_updated_at: str = ""
+
 
 # Common test file patterns for different frameworks
 FILE_PATTERNS = [
@@ -58,11 +108,19 @@ class WorkflowProcessor:
         self.github = GitHubService()
         self.gemini = GeminiService()
         self.config_service = ConfigService(self.github)
+        self.security_scanner = SecurityScanner()
 
     async def process_failure(self, installation_id: int, repo_full_name: str, run_id: int, branch: str = "main"):
         """
-        Orchestrates the full self-healing pipeline:
-        Auth -> Load Config -> Extract Evidence -> Identify Files -> Fetch Context -> AI Analysis -> Commit Fix
+        Orchestrates the Silent self-healing pipeline.
+        
+        Workflow:
+        - Main branch fails → Create kintsugi-fix-*, push fix, NO PR
+        - kintsugi-fix-* fails → Check attempts, iterate with new fix, NO PR
+        - kintsugi-fix-* passes → NOW create PR with full report (handled by handle_kintsugi_success)
+        - Max attempts reached → Create PR with failure report
+        
+        The PR only surfaces upon success or final failure, respecting notification bandwidth.
         """
         try:
             # 1. Authenticate as the App
@@ -71,18 +129,40 @@ class WorkflowProcessor:
             owner, repo = repo_full_name.split("/")
 
             # 2. Load Repository Configuration
-            config = await self.config_service.get_config(installation_id, owner, repo, ref=branch)
+            # For kintsugi branches, load config from base branch
+            config_ref = branch if not branch.startswith("kintsugi-fix") else "main"
+            config = await self.config_service.get_config(installation_id, owner, repo, ref=config_ref)
             
-            # 3. Check if branch is allowed
-            if not self.config_service.is_branch_allowed(config, branch):
-                logger.info(f"⏭️ Branch '{branch}' is not in allowed list. Skipping.")
-                return
+            # 3. Check if this is an iteration on an existing kintsugi branch
+            is_iteration = branch.startswith("kintsugi-fix")
+            
+            if is_iteration:
+                # Check attempt count before proceeding
+                attempt_count = await self.github.get_branch_commit_count(
+                    token, repo_full_name, branch, "main"
+                )
+                logger.info(f"🔄 Iteration mode: Attempt #{attempt_count + 1} on branch '{branch}'")
+                
+                if attempt_count >= config.limits.max_attempts:
+                    logger.warning(
+                        f"⚠️ Max attempts ({config.limits.max_attempts}) reached for branch '{branch}'. "
+                        "Opening PR with failure report."
+                    )
+                    await self._handle_max_attempts_reached(
+                        token, installation_id, owner, repo, repo_full_name, branch, run_id, config
+                    )
+                    return
+            else:
+                # Check if original branch is allowed
+                if not self.config_service.is_branch_allowed(config, branch):
+                    logger.info(f"⏭️ Branch '{branch}' is not in allowed list. Skipping.")
+                    return
 
             # 4. Download Artifacts (if available)
             artifacts = await self._get_artifacts_with_retry(token, repo_full_name, run_id)
             
             # Initialize evidence with defaults
-            evidence = {"screenshot": None, "error_text": "No artifact error log available."}
+            evidence = {"screenshot": None, "video": None, "dom_snapshot": None, "error_text": "No artifact error log available."}
             broken_file_path = None
             
             if artifacts:
@@ -99,17 +179,17 @@ class WorkflowProcessor:
                     logger.info(f"📦 Found Artifact: {target_artifact['name']} (ID: {target_artifact['id']})")
                     zip_content = await self.github.download_artifact(installation_id, owner, repo, target_artifact["id"])
                     
-                    # 3. Extract Evidence (screenshot + error log)
+                    # Extract Evidence (screenshot + video + DOM + error log)
                     evidence = await self._extract_evidence(zip_content)
                     
-                    # 4. Dynamic File Discovery - Identify broken file from error log
+                    # Dynamic File Discovery - Identify broken file from error log
                     broken_file_path = self._identify_broken_file(evidence["error_text"])
                 else:
                     logger.warning("No test report artifact found in artifacts list.")
             else:
                 logger.warning(f"No artifacts found for run {run_id}. Will attempt to continue with defaults.")
             
-            # 5. Get repository file structure for context (needed for fallback discovery)
+            # 5. Get repository file structure for context
             fetch_branch = branch
             repo_files = await self.github.list_repository_files(token, repo_full_name, ref=fetch_branch)
             logger.info(f"📂 Repository has {len(repo_files)} files")
@@ -125,7 +205,7 @@ class WorkflowProcessor:
             
             logger.info(f"🎯 Identified broken file: {broken_file_path}")
 
-            # 6. Fetch the broken file content (with fallback to main if branch doesn't exist)
+            # 6. Fetch the broken file content
             file_data = await self.github.get_repository_content(
                 installation_id, owner, repo, broken_file_path, ref=fetch_branch
             )
@@ -134,8 +214,8 @@ class WorkflowProcessor:
             if not file_data and branch.startswith("kintsugi-fix"):
                 logger.warning(f"Branch '{branch}' not found, falling back to 'main'")
                 fetch_branch = "main"
-                branch = "main"  # Reset branch for subsequent operations
-                # Re-fetch repo files from the correct branch
+                branch = "main"
+                is_iteration = False
                 repo_files = await self.github.list_repository_files(token, repo_full_name, ref=fetch_branch)
                 file_data = await self.github.get_repository_content(
                     installation_id, owner, repo, broken_file_path, ref=fetch_branch
@@ -147,24 +227,30 @@ class WorkflowProcessor:
 
             broken_file_content = base64.b64decode(file_data["content"]).decode("utf-8")
 
-            # 8. Smart Context Retrieval - Parse imports and fetch related files
+            # 7. Smart Context Retrieval - Parse imports and fetch related files
             context_files = await self._fetch_context_files(
                 installation_id, owner, repo, fetch_branch,
                 broken_file_path, broken_file_content, repo_files
             )
             logger.info(f"📚 Fetched {len(context_files)} context files")
 
-            # 9. Call Gemini with full context
+            # 8. Determine target branch for session tracking
+            if is_iteration:
+                session_id = branch  # Reuse existing kintsugi branch name
+            else:
+                session_id = f"kintsugi-fix-{int(time.time())}"  # New branch name
+            
+            # 9. Call Gemini with full context (using Chat API for thought signature continuity)
             logger.info("🧠 Sending to Gemini with full context...")
             
-            # Get AI model based on config
             model_name = self.config_service.get_model_name(config)
             logger.info(f"🤖 Using AI model: {model_name} (mode: {config.ai.mode})")
             
             # Log media availability for debugging
             has_screenshot = evidence["screenshot"] is not None
             has_video = evidence.get("video") is not None
-            logger.info(f"📎 Media: screenshot={has_screenshot}, video={has_video}")
+            has_dom = evidence.get("dom_snapshot") is not None
+            logger.info(f"📎 Media: screenshot={has_screenshot}, video={has_video}, dom={has_dom}")
             
             fix_result = self.gemini.generate_fix(
                 primary_file_path=broken_file_path,
@@ -176,6 +262,8 @@ class WorkflowProcessor:
                 repo_file_structure=repo_files,
                 extra_instructions=config.ai.extra_instructions,
                 model_name=model_name,
+                session_id=session_id,
+                is_iteration=is_iteration,
             )
 
             logger.info("✨ KINTSUGI FIX GENERATED ✨")
@@ -210,29 +298,129 @@ class WorkflowProcessor:
             if protected_fixes:
                 logger.info(f"⏭️ Skipping protected files: {protected_fixes}")
 
-            # 12. Iterative Branching Strategy
-            target_branch, base_branch, is_new_branch = await self._determine_branch_strategy(
-                token, repo_full_name, branch, installation_id, owner, repo
-            )
+            # 12. Security scan - check LLM-generated code for vulnerabilities
+            security_passed, allowed_fixes = await self._security_scan_fixes(allowed_fixes, config)
+            if not allowed_fixes:
+                logger.error("❌ All fixes blocked by security scan. Aborting.")
+                return
 
-            # 13. Apply allowed fixes only
+            # 13. Determine branch strategy (create or reuse)
+            if is_iteration:
+                # Reuse existing kintsugi branch
+                target_branch = session_id
+                base_branch = "main"  # TODO: Store actual base in metadata
+                logger.info(f"🔄 Silent iteration: Pushing to existing branch '{target_branch}'")
+            else:
+                # Create new kintsugi branch (using pre-determined session_id)
+                target_branch = session_id
+                base_branch = branch
+                
+                logger.info(f"🌿 Creating new branch '{target_branch}' from '{base_branch}'...")
+                branch_sha = await self.github.get_branch_sha(token, repo_full_name, base_branch)
+                await self.github.create_branch(token, repo_full_name, target_branch, branch_sha)
+                logger.info(f"✅ Branch '{target_branch}' created")
+
+            # 14. Build and save metadata FIRST (before applying fixes)
+            current_attempt = await self.github.get_branch_commit_count(
+                token, repo_full_name, target_branch, base_branch
+            ) + 1 if is_iteration else 1
+            
+            # Create or update metadata
+            metadata = await self._get_or_create_metadata(
+                token, installation_id, owner, repo, target_branch, base_branch,
+                run_id, broken_file_path, evidence, fix_result, current_attempt
+            )
+            
+            # 15. Apply allowed fixes (silently)
             for fix in allowed_fixes:
                 await self._apply_fix(
                     token, installation_id, owner, repo, repo_full_name,
                     target_branch, fix.file_path, fix.content, fix_result.explanation
                 )
+            
+            # 16. Save/update metadata file in branch
+            await self._save_metadata(
+                token, installation_id, owner, repo, repo_full_name,
+                target_branch, metadata
+            )
 
-            # 14. Open PR only if we created a new branch
-            if is_new_branch:
-                await self._open_pull_request(
-                    token, repo_full_name, target_branch, base_branch,
-                    broken_file_path, run_id, fix_result.explanation
-                )
-            else:
-                logger.info(f"🔄 Iterative fix pushed to existing branch '{target_branch}'")
+            # 17. NO PR CREATION! Just log and wait for CI result
+            logger.info(f"Fix pushed to '{target_branch}'. Waiting for CI...")
+            logger.info(f"Attempt {current_attempt}/{config.limits.max_attempts}")
 
         except Exception as e:
             logger.error(f"❌ Error processing failure: {e}", exc_info=True)
+
+    async def _security_scan_fixes(
+        self, 
+        fixes: list,
+        config: KintsugiConfig | None = None
+    ) -> tuple[bool, list]:
+        """
+        Run security scan on LLM-generated fixes before committing.
+        
+        Uses Semgrep to detect:
+        - Hardcoded secrets/credentials
+        - SQL/Command injection vulnerabilities  
+        - XSS vulnerabilities
+        - Path traversal issues
+        - Other OWASP Top 10 vulnerabilities
+        
+        Args:
+            fixes: List of FileFix objects from Gemini.
+            config: Optional Kintsugi config for scan settings.
+        
+        Returns:
+            tuple: (all_passed: bool, safe_fixes: list of fixes that passed)
+        """
+        if not fixes:
+            return True, []
+        
+        # Check if scanning is disabled in config
+        if config and not config.security.scan_enabled:
+            logger.info("⏭️ Security scanning disabled in config")
+            return True, fixes
+        
+        strict_mode = config.security.block_on_critical if config else True
+        
+        logger.info(f"🔒 Running security scan on {len(fixes)} file(s)...")
+        
+        # Build dict of files to scan
+        files_to_scan = {fix.file_path: fix.content for fix in fixes}
+        
+        # Run the scan
+        results = self.security_scanner.scan_multiple_files(files_to_scan, strict_mode=strict_mode)
+        
+        # Filter out fixes with blocking security issues
+        safe_fixes = []
+        blocked_files = []
+        
+        for fix in fixes:
+            result = results.get(fix.file_path)
+            if result and result.has_blocking_issues and strict_mode:
+                blocked_files.append(fix.file_path)
+                logger.error(
+                    f"🚫 Security blocked: {fix.file_path} "
+                    f"({result.error_count} critical issue(s))"
+                )
+                for finding in result.findings:
+                    if finding.severity == "ERROR":
+                        logger.error(
+                            f"   └─ {finding.rule_id}: {finding.message} (line {finding.line_start})"
+                        )
+            else:
+                safe_fixes.append(fix)
+        
+        all_passed = len(blocked_files) == 0
+        
+        if blocked_files:
+            logger.warning(
+                f"⚠️ Security scan blocked {len(blocked_files)} file(s): {blocked_files}"
+            )
+        else:
+            logger.info("✅ Security scan passed - no blocking issues found")
+        
+        return all_passed, safe_fixes
 
     def _identify_broken_file(self, error_text: str) -> str | None:
         """
@@ -590,60 +778,332 @@ class WorkflowProcessor:
         commit_url = commit_response.get("commit", {}).get("html_url", "N/A")
         logger.info(f"✅ Committed {file_path}: {commit_url}")
 
-    async def _open_pull_request(
+    async def _get_or_create_metadata(
+        self,
+        token: str,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        target_branch: str,
+        base_branch: str,
+        run_id: int,
+        primary_file: str,
+        evidence: dict,
+        fix_result: FixResponse,
+        attempt_number: int,
+    ) -> KintsugiFixMetadata:
+        """
+        Get existing metadata from branch or create new metadata.
+        
+        Args:
+            Various context about the fix being applied.
+        
+        Returns:
+            KintsugiFixMetadata: The metadata object (existing or new).
+        """
+        # Try to fetch existing metadata
+        existing_metadata = await self._fetch_metadata(
+            installation_id, owner, repo, target_branch
+        )
+        
+        now = datetime.utcnow().isoformat() + "Z"
+        
+        if existing_metadata:
+            # Update existing metadata with new attempt
+            existing_metadata.thought_process = fix_result.thought_process
+            existing_metadata.explanation = fix_result.explanation
+            existing_metadata.last_updated_at = now
+            
+            # Update evidence (might have changed between attempts)
+            existing_metadata.evidence_used.screenshot = evidence.get("screenshot") is not None
+            existing_metadata.evidence_used.video = evidence.get("video") is not None
+            existing_metadata.evidence_used.dom_snapshot = evidence.get("dom_snapshot") is not None
+            
+            # Add new attempt record
+            error_summary = self._extract_error_summary(evidence.get("error_text", ""))
+            existing_metadata.attempts.append(AttemptRecord(
+                attempt_number=attempt_number,
+                timestamp=now,
+                error_summary=error_summary,
+                files_changed=[f.file_path for f in fix_result.fixes],
+            ))
+            
+            return existing_metadata
+        else:
+            # Create new metadata
+            error_summary = self._extract_error_summary(evidence.get("error_text", ""))
+            return KintsugiFixMetadata(
+                base_branch=base_branch,
+                original_run_id=run_id,
+                primary_file=primary_file,
+                evidence_used=EvidenceUsed(
+                    screenshot=evidence.get("screenshot") is not None,
+                    video=evidence.get("video") is not None,
+                    dom_snapshot=evidence.get("dom_snapshot") is not None,
+                ),
+                thought_process=fix_result.thought_process,
+                explanation=fix_result.explanation,
+                attempts=[AttemptRecord(
+                    attempt_number=attempt_number,
+                    timestamp=now,
+                    error_summary=error_summary,
+                    files_changed=[f.file_path for f in fix_result.fixes],
+                )],
+                started_at=now,
+                last_updated_at=now,
+            )
+
+    async def _fetch_metadata(
+        self,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        branch: str,
+    ) -> Optional[KintsugiFixMetadata]:
+        """Fetch existing metadata from the branch if it exists."""
+        try:
+            file_data = await self.github.get_repository_content(
+                installation_id, owner, repo, KINTSUGI_METADATA_FILE, ref=branch
+            )
+            if file_data and "content" in file_data:
+                content = base64.b64decode(file_data["content"]).decode("utf-8")
+                return KintsugiFixMetadata.model_validate_json(content)
+        except Exception as e:
+            logger.debug(f"No existing metadata found: {e}")
+        return None
+
+    async def _save_metadata(
+        self,
+        token: str,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        repo_full_name: str,
+        branch: str,
+        metadata: KintsugiFixMetadata,
+    ):
+        """Save metadata file to the branch."""
+        try:
+            content = metadata.model_dump_json(indent=2)
+            
+            # Check if file already exists
+            existing = await self.github.get_repository_content(
+                installation_id, owner, repo, KINTSUGI_METADATA_FILE, ref=branch
+            )
+            
+            if existing:
+                # Update existing file
+                await self.github.update_file(
+                    token=token,
+                    repo_full_name=repo_full_name,
+                    path=KINTSUGI_METADATA_FILE,
+                    message="chore(kintsugi): Update fix metadata",
+                    content=content,
+                    sha=existing["sha"],
+                    branch=branch,
+                )
+            else:
+                # Create new file using the create contents API
+                await self._create_file(
+                    token, repo_full_name, KINTSUGI_METADATA_FILE,
+                    content, branch, "chore(kintsugi): Add fix metadata"
+                )
+            
+            logger.debug(f"📝 Saved metadata to {KINTSUGI_METADATA_FILE}")
+        except Exception as e:
+            logger.warning(f"Failed to save metadata: {e}")
+
+    async def _create_file(
         self,
         token: str,
         repo_full_name: str,
-        head_branch: str,
-        base_branch: str,
-        primary_file: str,
-        run_id: int,
-        explanation: str,
+        path: str,
+        content: str,
+        branch: str,
+        message: str,
     ):
-        """Open a pull request for the fix."""
-        logger.info("🔀 Opening Pull Request...")
+        """Create a new file in the repository."""
+        import httpx
         
-        pr_body = f"""## Kintsugi Auto-Fix
+        url = f"https://api.github.com/repos/{repo_full_name}/contents/{path}"
+        encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                json={
+                    "message": message,
+                    "content": encoded_content,
+                    "branch": branch,
+                },
+            )
+            response.raise_for_status()
 
-**Run ID:** `{run_id}`
-**Primary File:** `{primary_file}`
+    def _extract_error_summary(self, error_text: str, max_length: int = 200) -> str:
+        """Extract a brief summary of the error for tracking."""
+        if not error_text:
+            return "No error text available"
+        
+        # Look for common error patterns
+        patterns = [
+            r'Error:?\s*(.+?)(?:\n|$)',
+            r'AssertionError:?\s*(.+?)(?:\n|$)',
+            r'TimeoutError:?\s*(.+?)(?:\n|$)',
+            r'expect\(.+?\)\.(.+?)(?:\n|$)',
+            r'Locator.+?failed(.+?)(?:\n|$)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, error_text, re.IGNORECASE)
+            if match:
+                summary = match.group(1).strip()[:max_length]
+                return summary
+        
+        # Fallback: first non-empty line
+        for line in error_text.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('---'):
+                return line[:max_length]
+        
+        return "Unknown error"
 
-### What was wrong:
-{explanation}
+    async def _handle_max_attempts_reached(
+        self,
+        token: str,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        repo_full_name: str,
+        branch: str,
+        run_id: int,
+        config: KintsugiConfig,
+    ):
+        """
+        Handle the case when max attempts have been reached without success.
+        Opens a PR with a failure report so humans can take over.
+        """
+        logger.info("🚨 Opening PR with failure report (max attempts exhausted)")
+        
+        # Fetch metadata for the report
+        metadata = await self._fetch_metadata(installation_id, owner, repo, branch)
+        
+        if not metadata:
+            logger.error("No metadata found for failure report")
+            return
+        
+        # Build failure PR body
+        attempts_table = self._build_attempts_table(metadata.attempts)
+        evidence_list = self._build_evidence_list(metadata.evidence_used)
+        
+        pr_body = f"""# 🚨 Kintsugi Auto-Fix - Human Assistance Required
 
-### Evidence analyzed:
-- 📸 Screenshot of UI at failure
-- 📋 Error log from CI/CD
-- 📄 Test code and imported dependencies
-- 🗂️ Repository file structure
+| Metric | Value |
+|--------|-------|
+| **Status** | ❌ **MAX ATTEMPTS REACHED** |
+| **Attempts** | {len(metadata.attempts)}/{config.limits.max_attempts} |
+| **Primary File** | `{metadata.primary_file}` |
+| **Original Run** | `{metadata.original_run_id}` |
+
+## ⚠️ What Happened
+
+Kintsugi attempted to fix this test **{len(metadata.attempts)} times** but the tests are still failing.
+This likely indicates a more complex issue that requires human review.
+
+## 🧠 Last AI Reasoning
+
+<details>
+<summary>Click to see Kintsugi's thought process</summary>
+
+{metadata.thought_process}
+
+</details>
+
+## 🛠️ Last Attempted Fix
+
+{metadata.explanation}
+
+## 📊 Attempt History
+
+{attempts_table}
+
+## 📎 Evidence Analyzed
+
+{evidence_list}
 
 ---
-*Generated automatically by [Kintsugi](https://github.com/AhmedAbubaker98/Kintsugi) - The Software Engineer Bot at your Side*
+
+**Next Steps:**
+1. Review the attempted fixes in this branch
+2. Check if the issue is environmental (flaky test, CI config)
+3. Make manual adjustments if needed
+4. Once fixed, Kintsugi can learn from this for future runs
+
+---
+*Generated by [Kintsugi](https://github.com/AhmedAbubaker98/Kintsugi) - The Autonomous QA Orchestrator*
 """
         
         pr_response = await self.github.create_pull_request(
             token=token,
             repo_full_name=repo_full_name,
-            title=f"🚑 Kintsugi Auto-Fix: {primary_file}",
+            title=f"🚨 Kintsugi Needs Help: {metadata.primary_file}",
             body=pr_body,
-            head=head_branch,
-            base=base_branch,
+            head=branch,
+            base=metadata.base_branch,
         )
         
         pr_url = pr_response.get("html_url", "N/A")
-        logger.info(f"✅ PR OPENED! URL: {pr_url}")
+        logger.info(f"🚨 Failure PR opened: {pr_url}")
+        
+        # Clean up the chat session since we're done with this fix
+        self.gemini.clear_session(branch)
+
+    def _build_attempts_table(self, attempts: list[AttemptRecord]) -> str:
+        """Build a markdown table of attempts."""
+        if not attempts:
+            return "*No attempt records available*"
+        
+        lines = ["| # | Time | Error | Files Changed |", "|---|------|-------|---------------|"]
+        for attempt in attempts:
+            files = ", ".join(f"`{f}`" for f in attempt.files_changed[:2])
+            if len(attempt.files_changed) > 2:
+                files += f" +{len(attempt.files_changed) - 2} more"
+            lines.append(f"| {attempt.attempt_number} | {attempt.timestamp[:16]} | {attempt.error_summary[:50]}... | {files} |")
+        
+        return "\n".join(lines)
+
+    def _build_evidence_list(self, evidence: EvidenceUsed) -> str:
+        """Build a list of evidence sources used."""
+        items = []
+        if evidence.screenshot:
+            items.append("- 📸 Screenshot of UI at failure")
+        if evidence.video:
+            items.append("- 🎬 Video recording of test execution")
+        if evidence.dom_snapshot:
+            items.append("- 🌐 DOM snapshot at failure time")
+        if evidence.error_log:
+            items.append("- 📋 Error log from CI/CD")
+        
+        if not items:
+            return "*No evidence was available*"
+        
+        return "\n".join(items)
 
     async def _extract_evidence(self, zip_content: bytes) -> dict:
         """
-        Extract screenshot, video recording, and error text from the test report ZIP.
+        Extract screenshot, video recording, DOM snapshot, and error text from the test report ZIP.
         
         Args:
             zip_content: The downloaded artifact ZIP bytes.
         
         Returns:
-            dict: Contains 'screenshot' (bytes), 'video' (bytes), and 'error_text' (str).
+            dict: Contains 'screenshot' (bytes), 'video' (bytes), 'dom_snapshot' (str), and 'error_text' (str).
         """
-        evidence = {"screenshot": None, "video": None, "error_text": ""}
+        evidence = {"screenshot": None, "video": None, "dom_snapshot": None, "error_text": ""}
         
         try:
             with zipfile.ZipFile(io.BytesIO(zip_content)) as z:
@@ -672,6 +1132,27 @@ class WorkflowProcessor:
                     with open(f"debug_videos/{os.path.basename(video_file)}", "wb") as f:
                         f.write(evidence["video"])
                     logger.info(f"🎬 Video size: {len(evidence['video']):,} bytes")
+
+                # Find DOM snapshot (HTML files from Playwright traces or custom snapshots)
+                # Look for snapshot.html, dom.html, or files in trace folders
+                dom_files = [
+                    f for f in file_list 
+                    if f.endswith(".html") and any(
+                        keyword in f.lower() 
+                        for keyword in ["snapshot", "dom", "trace", "page"]
+                    )
+                ]
+                if dom_files:
+                    dom_file = dom_files[0]
+                    logger.info(f"🌐 Found DOM snapshot: {dom_file}")
+                    dom_content = z.read(dom_file).decode("utf-8", errors="ignore")
+                    evidence["dom_snapshot"] = dom_content[:50000]  # Limit size
+                    
+                    # Save for debugging
+                    os.makedirs("debug_dom", exist_ok=True)
+                    with open(f"debug_dom/{os.path.basename(dom_file)}", "w", encoding="utf-8") as f:
+                        f.write(dom_content)
+                    logger.info(f"🌐 DOM snapshot size: {len(dom_content):,} chars")
 
                 # Find error text - prioritize .md and .txt files
                 error_files = [f for f in file_list if f.endswith(('.md', '.txt', '.log'))]
@@ -706,7 +1187,7 @@ class WorkflowProcessor:
     ):
         """
         Handle successful workflow run on a Kintsugi branch.
-        Posts a success comment on the associated PR.
+        THIS IS THE MAGIC MOMENT - Create the PR with the full success report!
         
         Args:
             installation_id: The GitHub App installation ID.
@@ -717,36 +1198,143 @@ class WorkflowProcessor:
             owner, repo = repo_full_name.split("/")
             token = await self.github.get_installation_token(installation_id)
             
-            # Find the PR associated with this branch
-            pr = await self._find_pr_for_branch(token, repo_full_name, branch)
-            if not pr:
-                logger.warning(f"No open PR found for branch '{branch}'. Cannot post success comment.")
+            logger.info(f"🎉 SUCCESS on branch '{branch}'! Creating verified PR...")
+            
+            # Check if PR already exists (in case of re-runs)
+            existing_pr = await self._find_pr_for_branch(token, repo_full_name, branch)
+            if existing_pr:
+                # PR exists, just post success comment
+                pr_number = existing_pr.get("number")
+                logger.info(f"PR #{pr_number} already exists, posting success update")
+                
+                success_comment = (
+                    "## ✅ All Tests Passing!\n\n"
+                    "Great news! All tests are now passing on this branch. 🎉\n\n"
+                    "If you need any further amendments, just mention me with **@Kintsugi** "
+                    "and describe what you'd like changed.\n\n"
+                    "---\n"
+                    "*🤖 Kintsugi - Self-Healing Test Bot*"
+                )
+                
+                await self.github.create_pr_comment(
+                    installation_id=installation_id,
+                    owner=owner,
+                    repo=repo,
+                    pull_number=pr_number,
+                    body=success_comment,
+                )
+                logger.info(f"✅ Posted success comment on PR #{pr_number}")
                 return
             
-            pr_number = pr.get("number")
+            # No PR exists - THIS IS THE MAGIC MOMENT! Create the verified PR
+            metadata = await self._fetch_metadata(installation_id, owner, repo, branch)
             
-            # Post success comment
-            success_comment = (
-                "## ✅ Tests Passed!\n\n"
-                "Great news! All tests are now passing on this branch. 🎉\n\n"
-                "If you need any further amendments, just mention me with **@Kintsugi** "
-                "and describe what you'd like changed.\n\n"
-                "---\n"
-                "* Kintsugi - Self-Healing Test Bot*"
+            if not metadata:
+                logger.warning(f"No metadata found for branch '{branch}'. Creating basic PR.")
+                # Fallback to basic PR
+                await self.github.create_pull_request(
+                    token=token,
+                    repo_full_name=repo_full_name,
+                    title=f"✅ Kintsugi Auto-Fix (Verified)",
+                    body="Tests are passing! This fix was verified by CI.",
+                    head=branch,
+                    base="main",
+                )
+                return
+            
+            # Build the HIGH-FIDELITY PR report
+            pr_body = self._build_success_pr_body(metadata)
+            
+            pr_response = await self.github.create_pull_request(
+                token=token,
+                repo_full_name=repo_full_name,
+                title=f"✅ Kintsugi Verified Fix: {metadata.primary_file}",
+                body=pr_body,
+                head=branch,
+                base=metadata.base_branch,
             )
             
-            await self.github.create_pr_comment(
-                installation_id=installation_id,
-                owner=owner,
-                repo=repo,
-                pull_number=pr_number,
-                body=success_comment,
-            )
+            pr_url = pr_response.get("html_url", "N/A")
+            logger.info(f"🎉 VERIFIED PR OPENED! URL: {pr_url}")
             
-            logger.info(f"✅ Posted success comment on PR #{pr_number}")
+            # Clean up the chat session since we're done with this fix
+            self.gemini.clear_session(branch)
             
         except Exception as e:
             logger.error(f"❌ Failed to handle Kintsugi success: {e}", exc_info=True)
+
+    def _build_success_pr_body(self, metadata: KintsugiFixMetadata) -> str:
+        """Build the high-fidelity PR body for a successful fix."""
+        
+        # Build evidence list
+        evidence_items = []
+        if metadata.evidence_used.screenshot:
+            evidence_items.append("📸 Screenshot")
+        if metadata.evidence_used.video:
+            evidence_items.append("🎬 Video")
+        if metadata.evidence_used.dom_snapshot:
+            evidence_items.append("🌐 DOM")
+        if metadata.evidence_used.error_log:
+            evidence_items.append("📋 Logs")
+        evidence_str = " + ".join(evidence_items) if evidence_items else "Code Only"
+        
+        # Build attempts summary
+        attempts_count = len(metadata.attempts)
+        
+        # Build the PR body
+        pr_body = f"""# ✅ Kintsugi Self-Healing Report
+
+| Metric | Value |
+|--------|-------|
+| **Status** | ✅ **VERIFIED FIX** (CI Passed) |
+| **Attempts** | {attempts_count} iteration(s) |
+| **Evidence** | {evidence_str} |
+| **Primary File** | `{metadata.primary_file}` |
+
+## 🧠 Thought Process
+
+<details>
+<summary>Click to see Kintsugi's AI reasoning</summary>
+
+{metadata.thought_process}
+
+</details>
+
+## 🛠️ The Fix
+
+{metadata.explanation}
+
+"""
+        
+        # Add attempt history if multiple attempts
+        if attempts_count > 1:
+            pr_body += f"""## 📊 Iteration History
+
+{self._build_attempts_table(metadata.attempts)}
+
+"""
+        
+        # Add evidence section
+        evidence_list = self._build_evidence_list(metadata.evidence_used)
+        pr_body += f"""## 📎 Evidence Analyzed
+
+{evidence_list}
+
+"""
+        
+        # Footer
+        pr_body += """---
+
+**What's Next?**
+- Review the changes and merge if satisfied
+- Need adjustments? Comment with **@Kintsugi** and your feedback
+- This fix was automatically verified by your CI pipeline
+
+---
+*Generated by [Kintsugi](https://github.com/AhmedAbubaker98/Kintsugi) - The Autonomous QA Orchestrator*
+"""
+        
+        return pr_body
 
     async def _find_pr_for_branch(
         self,
@@ -858,7 +1446,7 @@ class WorkflowProcessor:
             # 7. Get AI model from config
             model_name = self.config_service.get_model_name(config)
             
-            # 8. Call Gemini to generate amendments
+            # 8. Call Gemini to generate amendments (using Chat API for conversation continuity)
             logger.info("🧠 Sending to Gemini for amendment generation...")
             amendment_result = self.gemini.generate_amendment(
                 comment_body=comment_body,
@@ -869,13 +1457,17 @@ class WorkflowProcessor:
                 repo_file_structure=repo_files,
                 extra_instructions=config.ai.extra_instructions,
                 model_name=model_name,
+                session_id=head_branch,  # Use branch name for session continuity
             )
             
             logger.info(f"✨ Gemini generated {len(amendment_result.fixes)} amendment(s)")
             
-            # 9. Apply the amendments (commit to the same branch)
+            # 9. Security scan amendments before applying
             if amendment_result.fixes:
-                for fix in amendment_result.fixes:
+                _, safe_fixes = await self._security_scan_fixes(amendment_result.fixes, config)
+                
+                # 10. Apply the safe amendments (commit to the same branch)
+                for fix in safe_fixes:
                     # Check protected paths
                     if self.config_service.is_path_protected(config, fix.file_path):
                         logger.warning(f"🛡️ Skipping protected file: {fix.file_path}")
@@ -887,7 +1479,7 @@ class WorkflowProcessor:
                         f"Kintsugi amendment per @{comment_author}'s feedback"
                     )
             
-            # 10. Post reply comment
+            # 11. Post reply comment
             reply_body = f"{amendment_result.reply}\n\n---\n*🤖 Kintsugi - Self-Healing Test Bot*"
             await self.github.create_pr_comment(
                 installation_id=installation_id,
