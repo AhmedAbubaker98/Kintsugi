@@ -29,6 +29,8 @@ dependencies = [
     "PyJWT>=2.8.0",
     "cryptography>=41.0.0",
     "python-dotenv>=1.0.0",
+    "arq>=0.26.0",
+    "redis>=5.0.0",
 ]
 
 [project.optional-dependencies]

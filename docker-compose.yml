@@ -1,0 +1,94 @@
+# Kintsugi - Docker Compose for Local Development
+#
+# This file orchestrates the Producer-Consumer architecture:
+# - web:    FastAPI application that receives webhooks and enqueues jobs
+# - worker: arq worker that processes jobs from the queue
+#
+# Usage:
+#   Start all services:     docker compose up
+#   Start in background:    docker compose up -d
+#   View logs:              docker compose logs -f
+#   Stop all services:      docker compose down
+#
+# For local development with Upstash Redis, no local redis container is needed.
+# Just ensure REDIS_URL in .env points to your Upstash instance.
+
+version: "3.8"
+
+services:
+  # ==========================================================================
+  # WEB SERVICE (Producer)
+  # ==========================================================================
+  # Receives GitHub webhooks, validates signatures, and enqueues jobs
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kintsugi-web
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DEBUG=true
+    volumes:
+      # Mount source code for hot reloading during development
+      - ./app:/app/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ==========================================================================
+  # WORKER SERVICE (Consumer)
+  # ==========================================================================
+  # Processes jobs from the Redis queue (failure analysis, fix generation)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kintsugi-worker
+    command: arq app.worker.WorkerSettings
+    env_file:
+      - .env
+    environment:
+      - DEBUG=true
+    volumes:
+      # Mount source code for development (worker auto-restarts on changes)
+      - ./app:/app/app
+    restart: unless-stopped
+    # Worker depends on web starting first (ensures Redis URL is valid)
+    depends_on:
+      web:
+        condition: service_healthy
+
+# ==========================================================================
+# NETWORKS
+# ==========================================================================
+networks:
+  default:
+    name: kintsugi-network
+
+# ==========================================================================
+# NOTES
+# ==========================================================================
+# Redis:
+#   This compose file assumes you're using Upstash Redis (cloud-hosted).
+#   The REDIS_URL in your .env should be:
+#   REDIS_URL="rediss://default:YOUR_PASSWORD@YOUR_HOST.upstash.io:6379"
+#
+#   If you need local Redis for offline development, add:
+#   redis:
+#     image: redis:7-alpine
+#     ports:
+#       - "6379:6379"
+#   And set REDIS_URL="redis://redis:6379" in .env
+#
+# Webhook Testing:
+#   For local development, use smee.io or ngrok to expose port 8000:
+#   - smee: smee -u https://smee.io/YOUR_CHANNEL -p 8000 -P /webhook
+#   - ngrok: ngrok http 8000

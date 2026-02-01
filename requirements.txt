@@ -23,6 +23,10 @@ cryptography>=41.0.0
 # Semgrep runs locally - no code sent to external services
 semgrep>=1.50.0
 
+# Async Redis Queue (Producer-Consumer architecture)
+arq>=0.26.0
+redis>=5.0.0
+
 # Development Dependencies
 python-dotenv>=1.0.0
 

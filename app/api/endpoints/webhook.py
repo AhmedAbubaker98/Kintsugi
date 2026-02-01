@@ -2,24 +2,22 @@
 GitHub webhook endpoint handler.
 
 This module receives and validates incoming GitHub webhook events,
-routing them to the appropriate service handlers based on event type.
+then enqueues jobs for the Worker to process asynchronously.
+
+This is the "Producer" side of the Producer-Consumer architecture.
 """
 
 import logging
 from typing import Any
 
+from arq.connections import ArqRedis
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from app.core.security import verify_webhook_signature
-from app.services.github_service import GitHubService
-from app.services.workflow_processor import WorkflowProcessor
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["webhooks"])
-
-# Initialize GitHub service
-github_service = GitHubService()
 
 
 @router.post(
@@ -86,11 +84,15 @@ async def handle_webhook(
         f"delivery={x_github_delivery}"
     )
     
+    # Get Redis pool from app state
+    redis: ArqRedis | None = getattr(request.app.state, "redis", None)
+    
     # Route event to appropriate handler
     response = await route_event(
         event_type=x_github_event,
         payload=event_payload,
         delivery_id=x_github_delivery,
+        redis=redis,
     )
     
     return response
@@ -100,6 +102,7 @@ async def route_event(
     event_type: str,
     payload: dict[str, Any],
     delivery_id: str,
+    redis: ArqRedis | None,
 ) -> dict[str, Any]:
     """
     Route GitHub events to appropriate service handlers.
@@ -108,6 +111,7 @@ async def route_event(
         event_type: The GitHub event type.
         payload: The parsed webhook payload.
         delivery_id: Unique delivery identifier.
+        redis: Redis connection pool for enqueueing jobs.
     
     Returns:
         dict: Response from the event handler.
@@ -116,13 +120,13 @@ async def route_event(
     
     match event_type:
         case "workflow_run":
-            return await handle_workflow_run(payload, delivery_id)
+            return await handle_workflow_run(payload, delivery_id, redis)
         
         case "check_run":
             return await handle_check_run(payload, delivery_id)
         
         case "issue_comment":
-            return await handle_issue_comment(payload, delivery_id)
+            return await handle_issue_comment(payload, delivery_id, redis)
         
         case "ping":
             return handle_ping(payload)
@@ -139,6 +143,7 @@ async def route_event(
 async def handle_workflow_run(
     payload: dict[str, Any],
     delivery_id: str,
+    redis: ArqRedis | None,
 ) -> dict[str, Any]:
     """
     Handle workflow_run events from GitHub Actions.
@@ -151,6 +156,7 @@ async def handle_workflow_run(
     Args:
         payload: The workflow_run event payload.
         delivery_id: Unique delivery identifier.
+        redis: Redis connection pool for enqueueing jobs.
     
     Returns:
         dict: Response indicating processing status.
@@ -168,7 +174,7 @@ async def handle_workflow_run(
         f"run_id={run_id}"
     )
     
-    # We only care about completed, failed workflow runs
+    # We only care about completed workflow runs
     if action != "completed":
         return {
             "status": "ignored",
@@ -185,6 +191,14 @@ async def handle_workflow_run(
     # Extract the branch name for the commit
     head_branch = workflow_run.get("head_branch", "main")
     
+    # Check if Redis is available
+    if not redis:
+        logger.error("❌ Redis not available - cannot enqueue job")
+        return {
+            "status": "error",
+            "reason": "Job queue unavailable",
+        }
+    
     # Handle successful workflow runs on Kintsugi branches
     if conclusion == "success" and head_branch.startswith("kintsugi-fix"):
         logger.info(
@@ -192,15 +206,19 @@ async def handle_workflow_run(
             f"branch={head_branch}, run_id={run_id}"
         )
         if installation_id and repo_full_name:
-            processor = WorkflowProcessor()
-            await processor.handle_kintsugi_success(
-                installation_id, repo_full_name, head_branch
+            await redis.enqueue_job(
+                "handle_success_task",
+                installation_id,
+                repo_full_name,
+                head_branch,
+                _queue_name="kintsugi:queue",
             )
+            logger.info(f"📤 Enqueued success job for {repo_full_name}@{head_branch}")
         return {
-            "status": "processed",
+            "status": "queued",
             "event": "workflow_run",
             "delivery_id": delivery_id,
-            "message": "Kintsugi fix succeeded - posted success comment",
+            "message": "Kintsugi success job enqueued",
         }
     
     if conclusion != "failure":
@@ -215,13 +233,18 @@ async def handle_workflow_run(
     )
     
     if installation_id and repo_full_name and run_id:
-        processor = WorkflowProcessor()
-        # We await this directly so you can see the logs in your terminal immediately.
-        # In production, we would use FastAPI BackgroundTasks here.
-        await processor.process_failure(installation_id, repo_full_name, run_id, head_branch)
+        await redis.enqueue_job(
+            "process_failure_task",
+            installation_id,
+            repo_full_name,
+            run_id,
+            head_branch,
+            _queue_name="kintsugi:queue",
+        )
+        logger.info(f"📤 Enqueued failure job for {repo_full_name}#{run_id}")
     
     return {
-        "status": "processing",
+        "status": "queued",
         "event": "workflow_run",
         "delivery_id": delivery_id,
         "workflow_run_id": run_id,
@@ -290,6 +313,7 @@ def handle_ping(payload: dict[str, Any]) -> dict[str, Any]:
 async def handle_issue_comment(
     payload: dict[str, Any],
     delivery_id: str,
+    redis: ArqRedis | None,
 ) -> dict[str, Any]:
     """
     Handle issue_comment events from GitHub.
@@ -300,6 +324,7 @@ async def handle_issue_comment(
     Args:
         payload: The issue_comment event payload.
         delivery_id: Unique delivery identifier.
+        redis: Redis connection pool for enqueueing jobs.
     
     Returns:
         dict: Response indicating processing status.
@@ -348,18 +373,28 @@ async def handle_issue_comment(
         f"'{comment_body[:100]}...'"
     )
     
+    # Check if Redis is available
+    if not redis:
+        logger.error("❌ Redis not available - cannot enqueue job")
+        return {
+            "status": "error",
+            "reason": "Job queue unavailable",
+        }
+    
     if installation_id and repo_full_name and issue_number:
-        processor = WorkflowProcessor()
-        await processor.process_comment(
-            installation_id=installation_id,
-            repo_full_name=repo_full_name,
-            pr_number=issue_number,
-            comment_body=comment_body,
-            comment_author=comment_author,
+        await redis.enqueue_job(
+            "process_comment_task",
+            installation_id,
+            repo_full_name,
+            issue_number,
+            comment_body,
+            comment_author,
+            _queue_name="kintsugi:queue",
         )
+        logger.info(f"📤 Enqueued comment job for {repo_full_name}#{issue_number}")
     
     return {
-        "status": "processing",
+        "status": "queued",
         "event": "issue_comment",
         "delivery_id": delivery_id,
         "pr_number": issue_number,

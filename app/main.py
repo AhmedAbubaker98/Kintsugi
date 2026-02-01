@@ -2,12 +2,16 @@
 Kintsugi - The Autonomous QA Orchestrator.
 
 Main FastAPI application entry point.
+This is the "Producer" in the Producer-Consumer architecture.
+It receives webhooks and enqueues jobs for the Worker to process.
 """
 
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+from arq import create_pool
+from arq.connections import ArqRedis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -18,7 +22,7 @@ from app.core.config import settings
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG if settings.debug else logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - [API] - %(name)s - %(levelname)s - %(message)s",
 )
 
 # Suppress noisy HTTP client logs
@@ -35,6 +39,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     Application lifespan manager.
     
     Handles startup and shutdown events for the application.
+    Initializes and cleans up the Redis connection pool for job enqueueing.
     
     Args:
         app: The FastAPI application instance.
@@ -47,10 +52,28 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(f"Debug mode: {settings.debug}")
     logger.info(f"GitHub App ID: {settings.github_app_id}")
     
+    # Initialize Redis pool for arq job enqueueing
+    from app.worker import get_redis_settings
+    redis_settings = get_redis_settings()
+    
+    try:
+        redis_pool: ArqRedis = await create_pool(redis_settings)
+        app.state.redis = redis_pool
+        logger.info("✅ Redis connection pool initialized")
+    except Exception as e:
+        logger.error(f"❌ Failed to connect to Redis: {e}")
+        # Allow app to start even without Redis for health checks
+        app.state.redis = None
+    
     yield
     
     # Shutdown
     logger.info(f"Shutting down {settings.app_name}...")
+    
+    # Close Redis pool
+    if hasattr(app.state, "redis") and app.state.redis:
+        await app.state.redis.close()
+        logger.info("✅ Redis connection pool closed")
 
 
 def create_app() -> FastAPI:

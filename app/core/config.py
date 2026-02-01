@@ -73,6 +73,14 @@ class Settings(BaseSettings):
     api_host: str = Field(default="0.0.0.0", description="API server host")
     api_port: int = Field(default=8000, description="API server port")
     
+    # Redis Configuration (for arq worker queue)
+    # Supports rediss:// scheme for SSL (required by Upstash)
+    redis_url: str = Field(
+        default="redis://localhost:6379",
+        description="Redis connection URL (use rediss:// for SSL)",
+        json_schema_extra={"env": "REDIS_URL"},
+    )
+    
     # GitHub API Configuration
     github_api_base_url: str = Field(
         default="https://api.github.com",
