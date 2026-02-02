@@ -10,7 +10,7 @@
 
 ### Step 1: Install the GitHub App
 
-[**→ Install Kintsugi**](https://github.com/apps/kintsugi-bot)
+[**→ Install Kintsugi**](https://github.com/apps/kintsugi-app)
 
 Grant access to the repositories where you want automatic test healing.
 
