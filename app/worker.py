@@ -188,7 +188,7 @@ async def process_comment_task(
     comment_author: str,
 ) -> dict[str, Any]:
     """
-    Process a comment mentioning @Kintsugi.
+    Process a comment mentioning @kintsugi-app.
     
     This job:
     1. Fetches the PR context and Kintsugi's previous changes

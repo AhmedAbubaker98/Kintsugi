@@ -555,7 +555,7 @@ OUTPUT: Return a JSON object with:
         Uses Chat API to maintain conversation context if multiple amendments are requested.
         
         Args:
-            comment_body: The user's comment text mentioning @kintsugi.
+            comment_body: The user's comment text mentioning @kintsugi-app.
             comment_author: GitHub username of the commenter.
             changed_files: Dictionary of file paths to their current content (Kintsugi's changes).
             context_files: Dictionary of imported file paths to their contents.

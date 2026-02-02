@@ -1222,7 +1222,7 @@ This likely indicates a more complex issue that requires human review.
                 success_comment = (
                     "## ✅ All Tests Passing!\n\n"
                     "Great news! All tests are now passing on this branch. 🎉\n\n"
-                    "If you need any further amendments, just mention me with **@Kintsugi** "
+                    "If you need any further amendments, just mention me with **@kintsugi-app** "
                     "and describe what you'd like changed.\n\n"
                     "---\n"
                     "*🤖 Kintsugi - Self-Healing Test Bot*"
@@ -1339,7 +1339,7 @@ This likely indicates a more complex issue that requires human review.
 
 **What's Next?**
 - Review the changes and merge if satisfied
-- Need adjustments? Comment with **@Kintsugi** and your feedback
+- Need adjustments? Comment with **@kintsugi-app** and your feedback
 - This fix was automatically verified by your CI pipeline
 
 ---
@@ -1392,7 +1392,7 @@ This likely indicates a more complex issue that requires human review.
         comment_author: str,
     ):
         """
-        Process a comment mentioning @Kintsugi and generate amendments.
+        Process a comment mentioning @kintsugi-app and generate amendments.
         
         Args:
             installation_id: The GitHub App installation ID.
@@ -1405,7 +1405,7 @@ This likely indicates a more complex issue that requires human review.
             owner, repo = repo_full_name.split("/")
             token = await self.github.get_installation_token(installation_id)
             
-            logger.info(f"🗣️ Processing @Kintsugi mention on PR #{pr_number} by @{comment_author}")
+            logger.info(f"🗣️ Processing @kintsugi-app mention on PR #{pr_number} by @{comment_author}")
             
             # 1. Get PR details to find the branch
             pr = await self.github.get_pull_request(installation_id, owner, repo, pr_number)

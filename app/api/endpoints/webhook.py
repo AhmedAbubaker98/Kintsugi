@@ -318,7 +318,7 @@ async def handle_issue_comment(
     """
     Handle issue_comment events from GitHub.
     
-    This handles comments on PRs that mention @kintsugi, allowing
+    This handles comments on PRs that mention @kintsugi-app, allowing
     users to request amendments to Kintsugi's fixes.
     
     Args:
@@ -361,15 +361,15 @@ async def handle_issue_comment(
             "reason": "Comment is on an issue, not a pull request",
         }
     
-    # Check if @kintsugi is mentioned (case-insensitive)
-    if "@kintsugi" not in comment_body.lower():
+    # Check if @kintsugi-app is mentioned (case-insensitive)
+    if "@kintsugi-app" not in comment_body.lower():
         return {
             "status": "ignored",
-            "reason": "Comment does not mention @kintsugi",
+            "reason": "Comment does not mention @kintsugi-app",
         }
     
     logger.info(
-        f"🗣️ @Kintsugi mentioned in PR #{issue_number} by {comment_author}: "
+        f"🗣️ @kintsugi-app mentioned in PR #{issue_number} by {comment_author}: "
         f"'{comment_body[:100]}...'"
     )
     
@@ -399,5 +399,5 @@ async def handle_issue_comment(
         "delivery_id": delivery_id,
         "pr_number": issue_number,
         "repository": repo_full_name,
-        "message": "@Kintsugi mention queued for processing",
+        "message": "@kintsugi-app mention queued for processing",
     }

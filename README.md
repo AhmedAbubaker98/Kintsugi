@@ -138,7 +138,7 @@ Kintsugi PRs aren't fire-and-forget. You can **reply to refine the fix**.
 
 **You comment:**
 ```
-@kintsugi Don't use arbitrary waits. Use waitForSelector on the loading spinner instead.
+@kintsugi-app Don't use arbitrary waits. Use waitForSelector on the loading spinner instead.
 ```
 
 **Kintsugi responds:**
