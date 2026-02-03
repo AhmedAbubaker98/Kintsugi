@@ -112,6 +112,10 @@ CI_INFRASTRUCTURE_FAILURE_PATTERNS = [
     r'tsc.*error TS\d+',  # TypeScript compilation errors
     r'SyntaxError:.*Unexpected token',  # JS syntax errors at build time
     r'Build failed|Compilation failed',
+    # Port / server conflicts (CI starts server separately)
+    r'is already used, make sure that nothing is running',
+    r'address already in use|EADDRINUSE',
+    r'port \d+ is already allocated',
 ]
 
 # Import patterns for different languages (more comprehensive)
@@ -402,18 +406,29 @@ class WorkflowProcessor:
                 run_id, broken_file_path, evidence, fix_result, current_attempt
             )
             
-            # 16. Apply allowed fixes (silently)
-            for fix in allowed_fixes:
-                await self._apply_fix(
-                    token, installation_id, owner, repo, repo_full_name,
-                    target_branch, fix.file_path, fix.content, fix_result.explanation
-                )
+            # 16. Apply all fixes in a SINGLE commit (batch)
+            files_to_commit = {fix.file_path: fix.content for fix in allowed_fixes}
             
-            # 17. Save/update metadata file in branch
-            await self._save_metadata(
-                token, installation_id, owner, repo, repo_full_name,
-                target_branch, metadata
+            # Include metadata in the same commit
+            metadata_content = metadata.model_dump_json(indent=2)
+            files_to_commit[".kintsugi/fix_metadata.json"] = metadata_content
+            
+            # Build commit message
+            commit_msg = f"fix(kintsugi): {fix_result.explanation[:60]}"
+            if len(allowed_fixes) > 1:
+                commit_msg += f" (+{len(allowed_fixes)-1} files)"
+            
+            logger.info(f"🚑 Committing {len(allowed_fixes)} fix(es) to '{target_branch}'...")
+            commit_response = await self.github.push_commit(
+                installation_id=installation_id,
+                owner=owner,
+                repo=repo,
+                branch=target_branch,
+                message=commit_msg,
+                files=files_to_commit,
             )
+            commit_url = commit_response.get("html_url", "N/A")
+            logger.info(f"✅ Committed {len(allowed_fixes)} file(s): {commit_url}")
 
             # 18. NO PR CREATION! Just log and wait for CI result
             logger.info(f"Fix pushed to '{target_branch}'. Waiting for CI...")
