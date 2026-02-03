@@ -256,7 +256,7 @@ class WorkflowProcessor:
             logger.info("🧠 Sending to Gemini with full context...")
             
             model_name = self.config_service.get_model_name(config)
-            logger.info(f"🤖 Using AI model: {model_name} (mode: {config.ai.mode})")
+            logger.info(f" Using AI model: {model_name} (mode: {config.ai.mode})")
             
             # Log media availability for debugging
             has_screenshot = evidence["screenshot"] is not None
@@ -1215,27 +1215,10 @@ This likely indicates a more complex issue that requires human review.
             # Check if PR already exists (in case of re-runs)
             existing_pr = await self._find_pr_for_branch(token, repo_full_name, branch)
             if existing_pr:
-                # PR exists, just post success comment
+                # PR exists - the detailed PR report already conveys success
+                # No need for redundant "All Tests Passing" comments
                 pr_number = existing_pr.get("number")
-                logger.info(f"PR #{pr_number} already exists, posting success update")
-                
-                success_comment = (
-                    "## ✅ All Tests Passing!\n\n"
-                    "Great news! All tests are now passing on this branch. 🎉\n\n"
-                    "If you need any further amendments, just mention me with **@kintsugi-app** "
-                    "and describe what you'd like changed.\n\n"
-                    "---\n"
-                    "*🤖 Kintsugi - Self-Healing Test Bot*"
-                )
-                
-                await self.github.create_pr_comment(
-                    installation_id=installation_id,
-                    owner=owner,
-                    repo=repo,
-                    pull_number=pr_number,
-                    body=success_comment,
-                )
-                logger.info(f"✅ Posted success comment on PR #{pr_number}")
+                logger.info(f"PR #{pr_number} already exists - skipping (PR report is sufficient)")
                 return
             
             # No PR exists - THIS IS THE MAGIC MOMENT! Create the verified PR
@@ -1503,7 +1486,7 @@ This likely indicates a more complex issue that requires human review.
                     )
             
             # 12. Post reply comment
-            reply_body = f"{amendment_result.reply}\n\n---\n*🤖 Kintsugi - Self-Healing Test Bot*"
+            reply_body = f"{amendment_result.reply}\n\n---\n* Kintsugi - Self-Healing Test Bot*"
             await self.github.create_pr_comment(
                 installation_id=installation_id,
                 owner=owner,

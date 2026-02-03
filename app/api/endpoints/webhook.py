@@ -206,6 +206,22 @@ async def handle_workflow_run(
             f"branch={head_branch}, run_id={run_id}"
         )
         if installation_id and repo_full_name:
+            # Deduplicate: Only process ONE success event per branch
+            # GitHub sends multiple workflow_run success events (one per job)
+            dedup_key = f"kintsugi:success:{repo_full_name}:{head_branch}"
+            
+            # SETNX returns True if key was set (first event), False if exists (duplicate)
+            is_first = await redis.set(dedup_key, "1", ex=300, nx=True)  # 5 min TTL
+            
+            if not is_first:
+                logger.debug(
+                    f"⏭️ Skipping duplicate success event for {repo_full_name}@{head_branch}"
+                )
+                return {
+                    "status": "ignored",
+                    "reason": "Duplicate success event (already processing)",
+                }
+            
             await redis.enqueue_job(
                 "handle_success_task",
                 installation_id,
