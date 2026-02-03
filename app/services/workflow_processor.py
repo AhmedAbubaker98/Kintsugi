@@ -1136,6 +1136,16 @@ class WorkflowProcessor:
         """
         logger.info("🚨 Opening PR with failure report (max attempts exhausted)")
         
+        # Check if PR already exists for this branch
+        existing_pr = await self._find_pr_for_branch(token, repo_full_name, branch)
+        if existing_pr:
+            pr_number = existing_pr.get("number")
+            pr_url = existing_pr.get("html_url", "N/A")
+            logger.info(f"PR #{pr_number} already exists - skipping duplicate PR creation: {pr_url}")
+            # Clean up the chat session since we're done
+            self.gemini.clear_session(branch)
+            return
+        
         # Fetch metadata for the report
         metadata = await self._fetch_metadata(installation_id, owner, repo, branch)
         
