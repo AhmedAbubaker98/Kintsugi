@@ -17,7 +17,7 @@ class BranchConfig(BaseModel):
 
 class LimitsConfig(BaseModel):
     """Safety limits to prevent runaway costs and changes."""
-    max_attempts: int = Field(default=3, ge=1, le=5)  # Cap at 5 to save API costs
+    max_attempts: int = Field(default=3, ge=1, le=10)  # Cap at 10 for stress testing
     max_files_changed: int = Field(default=2, ge=1)
 
 
