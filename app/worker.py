@@ -323,8 +323,15 @@ class WorkerSettings:
     # Queue settings
     queue_name = "kintsugi:queue"
     
+    # Polling interval - how often worker checks Redis for new jobs
+    # Default is 0.5s which burns through Upstash free tier (500k reads/month)
+    # At 0.5s: ~5.2M reads/month (way over limit)
+    # At 5.0s: ~520k reads/month (manageable)
+    # For AI jobs that take 30-60s, a 5s delay to job start is negligible
+    poll_delay = 5.0
+    
     # Health check interval
-    health_check_interval = 30
+    health_check_interval = 60  # Reduced from 30s to further save reads
 
 
 # For running with: arq app.worker.WorkerSettings
