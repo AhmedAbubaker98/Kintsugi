@@ -14,10 +14,16 @@ from arq.connections import ArqRedis
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from app.core.security import verify_webhook_signature
+from app.services.config_service import ConfigService
+from app.services.github_service import GitHubService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["webhooks"])
+
+# Initialize services for config checking
+_github_service = GitHubService()
+_config_service = ConfigService(_github_service)
 
 
 @router.post(
@@ -140,6 +146,32 @@ async def route_event(
             }
 
 
+async def _is_kintsugi_enabled(
+    installation_id: int,
+    repo_full_name: str,
+    ref: str = "main",
+) -> bool:
+    """
+    Check if Kintsugi is enabled for this repository.
+    
+    Args:
+        installation_id: GitHub App installation ID.
+        repo_full_name: Full repository name (owner/repo).
+        ref: Git reference to load config from.
+    
+    Returns:
+        bool: True if enabled, False otherwise.
+    """
+    try:
+        owner, repo = repo_full_name.split("/")
+        config = await _config_service.get_config(installation_id, owner, repo, ref=ref)
+        return config.enabled
+    except Exception as e:
+        logger.warning(f"Failed to check enabled status for {repo_full_name}: {e}")
+        # Default to enabled if we can't check (fail open)
+        return True
+
+
 async def handle_workflow_run(
     payload: dict[str, Any],
     delivery_id: str,
@@ -206,6 +238,14 @@ async def handle_workflow_run(
             f"branch={head_branch}, run_id={run_id}"
         )
         if installation_id and repo_full_name:
+            # Check if Kintsugi is enabled for this repo
+            if not await _is_kintsugi_enabled(installation_id, repo_full_name):
+                logger.info(f"⏸️ Kintsugi is disabled for {repo_full_name}. Skipping.")
+                return {
+                    "status": "ignored",
+                    "reason": "Kintsugi is disabled for this repository",
+                }
+            
             # Deduplicate: Only process ONE success event per branch
             # GitHub sends multiple workflow_run success events (one per job)
             dedup_key = f"kintsugi:success:{repo_full_name}:{head_branch}"
@@ -249,6 +289,14 @@ async def handle_workflow_run(
     )
     
     if installation_id and repo_full_name and run_id:
+        # Check if Kintsugi is enabled for this repo
+        if not await _is_kintsugi_enabled(installation_id, repo_full_name, ref=head_branch):
+            logger.info(f"⏸️ Kintsugi is disabled for {repo_full_name}. Skipping.")
+            return {
+                "status": "ignored",
+                "reason": "Kintsugi is disabled for this repository",
+            }
+        
         await redis.enqueue_job(
             "process_failure_task",
             installation_id,
@@ -398,6 +446,14 @@ async def handle_issue_comment(
         }
     
     if installation_id and repo_full_name and issue_number:
+        # Check if Kintsugi is enabled for this repo
+        if not await _is_kintsugi_enabled(installation_id, repo_full_name):
+            logger.info(f"⏸️ Kintsugi is disabled for {repo_full_name}. Skipping comment.")
+            return {
+                "status": "ignored",
+                "reason": "Kintsugi is disabled for this repository",
+            }
+        
         await redis.enqueue_job(
             "process_comment_task",
             installation_id,

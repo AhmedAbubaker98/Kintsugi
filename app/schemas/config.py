@@ -57,7 +57,9 @@ class KintsugiConfig(BaseModel):
     Example .github/kintsugi.yml:
     ```yaml
     version: 1
+    enabled: true  # Set to false to temporarily disable Kintsugi
     demo_password: "your-password-here"  # Required during hackathon demo period
+    cleanup_metadata: true  # Remove .kintsugi folder after PR is created
     branches:
       allow: ["main", "develop"]
       ignore: ["dependabot/**"]
@@ -74,9 +76,17 @@ class KintsugiConfig(BaseModel):
     ```
     """
     version: int = 1
+    enabled: bool = Field(
+        default=True,
+        description="Master toggle to enable/disable Kintsugi for this repository."
+    )
     demo_password: Optional[str] = Field(
         default=None,
         description="Required for activating the app during the hackathon demo period."
+    )
+    cleanup_metadata: bool = Field(
+        default=False,
+        description="If true, delete .kintsugi/fix_metadata.json from the branch after PR is created."
     )
     branches: BranchConfig = Field(default_factory=BranchConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
