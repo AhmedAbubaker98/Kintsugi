@@ -328,7 +328,7 @@ class WorkerSettings:
     # At 0.5s: ~5.2M reads/month (way over limit)
     # At 5.0s: ~520k reads/month (manageable)
     # For AI jobs that take 30-60s, a 5s delay to job start is negligible
-    poll_delay = 5.0
+    poll_delay = 10
     
     # Health check interval
     health_check_interval = 60  # Reduced from 30s to further save reads
