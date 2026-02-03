@@ -79,6 +79,41 @@ FILE_PATTERNS = [
     r'(?:in\s+|at\s+|from\s+)([^\s:()]+/e2e/[^\s:()]+\.[jt]sx?)',
 ]
 
+# CI/CD infrastructure failure patterns - Kintsugi should NOT try to fix these
+CI_INFRASTRUCTURE_FAILURE_PATTERNS = [
+    # Package manager / dependency issues
+    r'Dependencies lock file is not found',
+    r'package-lock\.json.*not found',
+    r'yarn\.lock.*not found',
+    r'pnpm-lock\.yaml.*not found',
+    r'npm ERR! code E(RESOLVE|NOENT|NOTFOUND)',
+    r'npm ERR! Could not resolve dependency',
+    r'npm ci.*can only install packages when.*package-lock\.json',
+    r'pip install.*failed|Could not find a version that satisfies',
+    r'ModuleNotFoundError:.*No module named',
+    # Docker / container issues
+    r'docker:.*not found|Cannot connect to the Docker daemon',
+    r'Error response from daemon',
+    # GitHub Actions setup issues
+    r'Error: (Setup|Install|Configure).*failed',
+    r'Unable to resolve action',
+    r'Node\.js.*is not.*supported',
+    r'Python.*is not.*supported',
+    # Network / auth issues
+    r'Could not resolve host',
+    r'ECONNREFUSED|ETIMEDOUT|ENOTFOUND',
+    r'401 Unauthorized|403 Forbidden',
+    r'rate limit exceeded',
+    # Resource / permission issues
+    r'ENOSPC|No space left on device',
+    r'ENOMEM|Cannot allocate memory',
+    r'Permission denied',
+    # Build tool issues (not test failures)
+    r'tsc.*error TS\d+',  # TypeScript compilation errors
+    r'SyntaxError:.*Unexpected token',  # JS syntax errors at build time
+    r'Build failed|Compilation failed',
+]
+
 # Import patterns for different languages (more comprehensive)
 JS_IMPORT_PATTERNS = [
     # ES6 imports: import x from './path' or import { x } from './path'
@@ -179,7 +214,7 @@ class WorkflowProcessor:
             artifacts = await self._get_artifacts_with_retry(token, repo_full_name, run_id)
             
             # Initialize evidence with defaults
-            evidence = {"screenshot": None, "video": None, "dom_snapshot": None, "error_text": "No artifact error log available."}
+            evidence = {"screenshot": None, "video": None, "dom_snapshot": None, "error_text": ""}
             broken_file_path = None
             
             if artifacts:
@@ -203,8 +238,27 @@ class WorkflowProcessor:
                     broken_file_path = self._identify_broken_file(evidence["error_text"])
                 else:
                     logger.warning("No test report artifact found in artifacts list.")
-            else:
-                logger.warning(f"No artifacts found for run {run_id}. Will attempt to continue with defaults.")
+            
+            # 5.5. If no artifacts or no error text, fetch workflow logs directly
+            if not evidence["error_text"]:
+                logger.info("📥 No artifact error log - fetching workflow run logs directly...")
+                try:
+                    workflow_logs = await self._fetch_workflow_logs(installation_id, owner, repo, run_id)
+                    if workflow_logs:
+                        evidence["error_text"] = workflow_logs
+                        logger.info(f"📜 Fetched {len(workflow_logs)} chars of workflow logs")
+                except Exception as e:
+                    logger.warning(f"Could not fetch workflow logs: {e}")
+                    evidence["error_text"] = "No error log available."
+            
+            # 5.6. Check for CI infrastructure failures BEFORE proceeding
+            is_infra_failure, infra_reason = self._is_infrastructure_failure(evidence["error_text"])
+            if is_infra_failure:
+                logger.warning(
+                    f"🔧 CI INFRASTRUCTURE FAILURE detected: {infra_reason}\n"
+                    "This is not a test failure - Kintsugi cannot fix this. Skipping."
+                )
+                return
             
             # 6. Get repository file structure for context
             fetch_branch = branch
@@ -438,6 +492,31 @@ class WorkflowProcessor:
             logger.info("✅ Security scan passed - no blocking issues found")
         
         return all_passed, safe_fixes
+
+    def _is_infrastructure_failure(self, error_text: str) -> tuple[bool, str | None]:
+        """
+        Check if the error is a CI/CD infrastructure failure that Kintsugi cannot fix.
+        
+        These are issues like missing lock files, dependency resolution failures,
+        Docker problems, etc. - not actual test failures.
+        
+        Args:
+            error_text: The error log content.
+        
+        Returns:
+            tuple[bool, str | None]: (is_infrastructure_failure, matched_pattern_description)
+        """
+        if not error_text:
+            return False, None
+        
+        for pattern in CI_INFRASTRUCTURE_FAILURE_PATTERNS:
+            match = re.search(pattern, error_text, re.IGNORECASE)
+            if match:
+                matched_text = match.group(0)[:100]  # First 100 chars of match
+                logger.info(f"🔧 Detected CI infrastructure failure: '{matched_text}'")
+                return True, matched_text
+        
+        return False, None
 
     def _identify_broken_file(self, error_text: str) -> str | None:
         """
@@ -1246,6 +1325,65 @@ This likely indicates a more complex issue that requires human review.
             logger.error(f"Failed to extract evidence: {e}")
 
         return evidence
+
+    async def _fetch_workflow_logs(
+        self,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        run_id: int,
+    ) -> str:
+        """
+        Fetch workflow run logs directly from GitHub API.
+        
+        Used when no artifacts are available to get error context.
+        The logs are returned as a ZIP file which we extract.
+        
+        Args:
+            installation_id: GitHub App installation ID.
+            owner: Repository owner.
+            repo: Repository name.
+            run_id: Workflow run ID.
+        
+        Returns:
+            str: Concatenated log content (truncated to reasonable size).
+        """
+        try:
+            logs_zip = await self.github.get_workflow_run_logs(
+                installation_id, owner, repo, run_id
+            )
+            
+            if not logs_zip:
+                return ""
+            
+            # Extract logs from ZIP
+            log_content = []
+            with zipfile.ZipFile(io.BytesIO(logs_zip)) as z:
+                file_list = z.namelist()
+                logger.debug(f"Workflow logs ZIP contains: {file_list}")
+                
+                # Sort to process in order (job names are usually numbered)
+                for log_file in sorted(file_list):
+                    if log_file.endswith('.txt'):
+                        try:
+                            content = z.read(log_file).decode("utf-8", errors="ignore")
+                            # Add file header for context
+                            log_content.append(f"--- {log_file} ---\n{content}")
+                        except Exception as e:
+                            logger.debug(f"Could not read {log_file}: {e}")
+            
+            # Concatenate and truncate
+            full_logs = "\n\n".join(log_content)
+            
+            # Keep last 15000 chars (usually contains the actual error)
+            if len(full_logs) > 15000:
+                full_logs = "... [truncated] ...\n" + full_logs[-15000:]
+            
+            return full_logs
+            
+        except Exception as e:
+            logger.warning(f"Failed to fetch workflow logs: {e}")
+            return ""
 
     async def handle_kintsugi_success(
         self,
