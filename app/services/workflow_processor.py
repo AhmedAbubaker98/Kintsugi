@@ -302,7 +302,17 @@ class WorkflowProcessor:
             
             # 6. Get repository file structure for context
             fetch_branch = branch
-            repo_files = await self.github.list_repository_files(token, repo_full_name, ref=fetch_branch)
+            try:
+                repo_files = await self.github.list_repository_files(token, repo_full_name, ref=fetch_branch)
+            except Exception as e:
+                if "404" in str(e) and branch.startswith("kintsugi-fix"):
+                    logger.warning(f"⚠️ Branch '{branch}' was deleted. Falling back to main.")
+                    fetch_branch = "main"
+                    branch = "main"
+                    is_iteration = False
+                    repo_files = await self.github.list_repository_files(token, repo_full_name, ref=fetch_branch)
+                else:
+                    raise
             logger.info(f"📂 Repository has {len(repo_files)} files")
             
             # Fallback: If no broken file identified, try artifact-derived hint first

@@ -200,17 +200,29 @@ class GeminiService:
         Returns:
             types.File: The uploaded file object ready for use in prompts, or None if failed.
         """
+        import tempfile
+        
         try:
             logger.info(f"📹 Uploading video ({len(video_bytes):,} bytes) to Gemini File API...")
             
-            # Upload the file
-            uploaded_file = self.client.files.upload(
-                file=video_bytes,
-                config=types.UploadFileConfig(
-                    display_name=filename,
-                    mime_type="video/webm"
+            # Write bytes to temp file - Gemini SDK expects a file path, not bytes
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+                tmp.write(video_bytes)
+                tmp_path = tmp.name
+            
+            try:
+                # Upload the file from disk
+                uploaded_file = self.client.files.upload(
+                    file=tmp_path,
+                    config=types.UploadFileConfig(
+                        display_name=filename,
+                        mime_type="video/webm"
+                    )
                 )
-            )
+            finally:
+                # Clean up temp file
+                import os
+                os.unlink(tmp_path)
             
             logger.info(f"📤 Upload initiated: {uploaded_file.name} (state: {uploaded_file.state})")
             
