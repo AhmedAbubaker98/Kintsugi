@@ -252,6 +252,15 @@ class WorkflowProcessor:
                     
                     # Dynamic File Discovery - Identify broken file from error log
                     broken_file_path = self._identify_broken_file(evidence["error_text"])
+                    
+                    # If error log parsing failed, try artifact path extraction
+                    if not broken_file_path and evidence.get("failing_test_file"):
+                        test_base = evidence["failing_test_file"]
+                        logger.info(f"🔍 Using artifact-derived test file: {test_base}")
+                        # Search repo for matching test file
+                        for pattern in [f"**/{test_base}.spec.*", f"**/{test_base}.test.*", f"**/{test_base}.cy.*", f"**/e2e/{test_base}.*"]:
+                            # Will be resolved later when repo_files are available
+                            evidence["_test_file_hint"] = test_base
                 else:
                     logger.warning(f"No test report artifact matched patterns. Available: {artifact_names}")
             
@@ -296,7 +305,18 @@ class WorkflowProcessor:
             repo_files = await self.github.list_repository_files(token, repo_full_name, ref=fetch_branch)
             logger.info(f"📂 Repository has {len(repo_files)} files")
             
-            # Fallback: If no broken file identified, try to find test files in the repo
+            # Fallback: If no broken file identified, try artifact-derived hint first
+            if not broken_file_path and evidence.get("_test_file_hint"):
+                test_hint = evidence["_test_file_hint"]
+                logger.info(f"🔍 Searching for test file matching hint: {test_hint}")
+                for f in repo_files:
+                    fname = os.path.basename(f).lower()
+                    if fname.startswith(test_hint.lower()) and any(ext in fname for ext in [".spec.", ".test.", ".cy."]):
+                        broken_file_path = f
+                        logger.info(f"📍 Found matching test file from artifact hint: {f}")
+                        break
+            
+            # Final fallback: Search entire repo for test files
             if not broken_file_path:
                 logger.warning("Could not identify broken file from error log. Searching repo for test files...")
                 broken_file_path = self._find_test_file_in_repo(repo_files)
@@ -1345,12 +1365,32 @@ This likely indicates a more complex issue that requires human review.
         Returns:
             dict: Contains 'screenshot' (bytes), 'video' (bytes), 'dom_snapshot' (str), and 'error_text' (str).
         """
-        evidence = {"screenshot": None, "video": None, "dom_snapshot": None, "error_text": ""}
+        evidence = {"screenshot": None, "video": None, "dom_snapshot": None, "error_text": "", "failing_test_file": None}
         
         try:
             with zipfile.ZipFile(io.BytesIO(zip_content)) as z:
                 file_list = z.namelist()
                 logger.info(f"📂 Artifact contents: {len(file_list)} files")
+                
+                # Extract failing test file from artifact paths
+                # Playwright: test-results/t2-Level-2-Dynamic-Modal-should.../test-failed-1.png → t2
+                # Cypress: videos/spec-name.cy.js.mp4, screenshots/spec-name.cy.js/...
+                for f in file_list:
+                    if "test-results/" in f or "test-failed" in f:
+                        # Playwright format: test-results/<testname>-<description>-<browser>/...
+                        match = re.search(r'test-results/([^-/]+)', f)
+                        if match:
+                            test_base = match.group(1)  # e.g., "t2"
+                            evidence["failing_test_file"] = test_base
+                            logger.info(f"🎯 Extracted failing test from artifact path: {test_base}")
+                            break
+                    elif "videos/" in f and f.endswith(".mp4"):
+                        # Cypress format: videos/spec-name.cy.js.mp4
+                        match = re.search(r'videos/(.+\.(?:cy|spec)\.[jt]sx?)(?:\.mp4)?', f)
+                        if match:
+                            evidence["failing_test_file"] = match.group(1)
+                            logger.info(f"🎯 Extracted failing test from Cypress video: {match.group(1)}")
+                            break
 
                 # Find screenshot
                 screenshot_file = next((f for f in file_list if f.endswith(".png")), None)
@@ -1370,10 +1410,12 @@ This likely indicates a more complex issue that requires human review.
                     video_bytes = z.read(video_file)
                     
                     # Validate video file - must be at least 10KB and have valid WebM header
+                    # WebM files start with EBML header: 0x1A 0x45 0xDF 0xA3
+                    WEBM_MAGIC = bytes([0x1A, 0x45, 0xDF, 0xA3])
                     if len(video_bytes) < 10000:
                         logger.warning(f"⚠️ Video too small ({len(video_bytes)} bytes), likely invalid - skipping")
-                    elif not video_bytes[:4] == b'\\x1aE\\xdf\\xa3':
-                        logger.warning("⚠️ Video does not have valid WebM header - skipping")
+                    elif video_bytes[:4] != WEBM_MAGIC:
+                        logger.warning(f"⚠️ Video does not have valid WebM header (got {video_bytes[:4].hex()}) - skipping")
                     else:
                         evidence["video"] = video_bytes
                         
