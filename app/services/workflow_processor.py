@@ -1367,13 +1367,21 @@ This likely indicates a more complex issue that requires human review.
                 video_file = next((f for f in file_list if f.endswith(".webm")), None)
                 if video_file:
                     logger.info(f"🎬 Found video recording: {video_file}")
-                    evidence["video"] = z.read(video_file)
+                    video_bytes = z.read(video_file)
                     
-                    # Save for debugging
-                    os.makedirs("debug_videos", exist_ok=True)
-                    with open(f"debug_videos/{os.path.basename(video_file)}", "wb") as f:
-                        f.write(evidence["video"])
-                    logger.info(f"🎬 Video size: {len(evidence['video']):,} bytes")
+                    # Validate video file - must be at least 10KB and have valid WebM header
+                    if len(video_bytes) < 10000:
+                        logger.warning(f"⚠️ Video too small ({len(video_bytes)} bytes), likely invalid - skipping")
+                    elif not video_bytes[:4] == b'\\x1aE\\xdf\\xa3':
+                        logger.warning("⚠️ Video does not have valid WebM header - skipping")
+                    else:
+                        evidence["video"] = video_bytes
+                        
+                        # Save for debugging
+                        os.makedirs("debug_videos", exist_ok=True)
+                        with open(f"debug_videos/{os.path.basename(video_file)}", "wb") as f:
+                            f.write(evidence["video"])
+                        logger.info(f"🎬 Video size: {len(evidence['video']):,} bytes")
 
                 # Find DOM snapshot (HTML files from Playwright traces or custom snapshots)
                 # Look for snapshot.html, dom.html, or files in trace folders

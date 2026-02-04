@@ -239,7 +239,11 @@ class GeminiService:
                 return None
                 
         except Exception as e:
-            logger.error(f"❌ Video upload failed: {e}")
+            # Don't log raw bytes - just the error type and message
+            error_msg = str(e)
+            if len(error_msg) > 200:
+                error_msg = f"{type(e).__name__}: {error_msg[:100]}... (truncated)"
+            logger.error(f"❌ Video upload failed: {error_msg}")
             return None
 
     def delete_file(self, file_name: str) -> bool:
