@@ -133,14 +133,28 @@ class ConfigService:
     def get_model_name(self, config: KintsugiConfig) -> str:
         """
         Get the Gemini model name based on AI mode config.
+        Both modes now use gemini-3-pro-preview with different thinking budgets.
         
         Args:
             config: The loaded configuration.
         
         Returns:
-            str: Model name to use.
+            str: Model name to use (always gemini-3-pro-preview).
+        """
+        # Both modes use Pro - thinking budget is controlled separately
+        return "gemini-3-pro-preview"
+    
+    def get_thinking_budget(self, config: KintsugiConfig) -> int:
+        """
+        Get the thinking budget based on AI mode config.
+        
+        Args:
+            config: The loaded configuration.
+        
+        Returns:
+            int: Thinking token budget (higher = more reasoning).
         """
         if config.ai.mode == "fast":
-            return "gemini-flash-latest"
+            return 1024  # Low thinking for speed
         else:  # "smart" or default
-            return "gemini-3-pro-preview"
+            return 8192  # High thinking for complex problems

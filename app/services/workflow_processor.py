@@ -319,7 +319,8 @@ class WorkflowProcessor:
             logger.info("🧠 Sending to Gemini with full context...")
             
             model_name = self.config_service.get_model_name(config)
-            logger.info(f" Using AI model: {model_name} (mode: {config.ai.mode})")
+            thinking_budget = self.config_service.get_thinking_budget(config)
+            logger.info(f" Using AI model: {model_name} (mode: {config.ai.mode}, thinking: {thinking_budget})")
             
             # Log media availability for debugging
             has_screenshot = evidence["screenshot"] is not None
@@ -337,6 +338,7 @@ class WorkflowProcessor:
                 repo_file_structure=repo_files,
                 extra_instructions=config.ai.extra_instructions,
                 model_name=model_name,
+                thinking_budget=thinking_budget,
                 session_id=session_id,
                 is_iteration=is_iteration,
             )
@@ -1686,8 +1688,9 @@ Helping developers do more of what they love by automating the tedious parts of 
             
             logger.info(f"📚 Fetched {len(context_files)} context files")
             
-            # 8. Get AI model from config
+            # 8. Get AI model and thinking budget from config
             model_name = self.config_service.get_model_name(config)
+            thinking_budget = self.config_service.get_thinking_budget(config)
             
             # 8. Call Gemini to generate amendments (using Chat API for conversation continuity)
             logger.info("🧠 Sending to Gemini for amendment generation...")
@@ -1700,6 +1703,7 @@ Helping developers do more of what they love by automating the tedious parts of 
                 repo_file_structure=repo_files,
                 extra_instructions=config.ai.extra_instructions,
                 model_name=model_name,
+                thinking_budget=thinking_budget,
                 session_id=head_branch,  # Use branch name for session continuity
             )
             

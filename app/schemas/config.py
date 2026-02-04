@@ -41,7 +41,7 @@ class SecurityConfig(BaseModel):
 
 class AIConfig(BaseModel):
     """AI behavior configuration."""
-    mode: str = Field(default="fast")  # smart=Pro, fast=Flash
+    mode: str = Field(default="fast")  # smart=high thinking, fast=low thinking (both use Pro)
     extra_instructions: Optional[str] = None
 
 

@@ -273,6 +273,7 @@ class GeminiService:
         repo_file_structure: list[str] | None = None,
         extra_instructions: str | None = None,
         model_name: str | None = None,
+        thinking_budget: int = 8192,
         session_id: str | None = None,
         is_iteration: bool = False,
     ) -> FixResponse:
@@ -292,6 +293,7 @@ class GeminiService:
             repo_file_structure: List of all file paths in the repository.
             extra_instructions: Additional instructions from user config (optional).
             model_name: Override the default model name (optional).
+            thinking_budget: Token budget for model thinking (1024=fast, 8192=smart).
             session_id: Unique ID for this fix session (e.g., branch name). 
                         Used to maintain chat history across iterations.
             is_iteration: If True, this is a follow-up attempt on an existing session.
@@ -457,12 +459,15 @@ OUTPUT: Return a JSON object with:
             debug_prompt += final_instruction
             self._save_prompt_debug(debug_prompt)
 
-            # 3. Configure for Structured JSON Output
+            # 3. Configure for Structured JSON Output with thinking budget
             config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.1,  # Low temperature for code precision
                 response_mime_type="application/json",
                 response_schema=FixResponse,
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=thinking_budget,
+                ),
             )
 
             # 4. Generate using Chat API (handles thought signatures automatically)
@@ -474,7 +479,7 @@ OUTPUT: Return a JSON object with:
                 )
                 if session_id:
                     self._chat_sessions[session_id] = chat
-                    logger.info(f"📝 Created new chat session: {session_id}")
+                    logger.info(f"📝 Created new chat session: {session_id} (thinking_budget={thinking_budget})")
             
             # Send message via chat (SDK preserves thought signatures automatically)
             response = chat.send_message(user_content)
@@ -548,6 +553,7 @@ OUTPUT: Return a JSON object with:
         repo_file_structure: list[str] | None = None,
         extra_instructions: str | None = None,
         model_name: str | None = None,
+        thinking_budget: int = 8192,
         session_id: str | None = None,
     ) -> AmendmentResponse:
         """
@@ -563,6 +569,7 @@ OUTPUT: Return a JSON object with:
             repo_file_structure: List of all file paths in the repository.
             extra_instructions: Additional instructions from user config (optional).
             model_name: Override the default model name (optional).
+            thinking_budget: Token budget for model thinking (1024=fast, 8192=smart).
             session_id: Unique identifier for this amendment conversation (branch name).
         
         Returns:
@@ -647,12 +654,15 @@ OUTPUT: Return a JSON object with:
             debug_prompt += f"--- USER COMMENT ---\n{comment_body}\n\n{changed_section}{context_section}{mentioned_section}{structure_section}"
             self._save_prompt_debug(debug_prompt)
             
-            # Configure for structured JSON output
+            # Configure for structured JSON output with thinking budget
             config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,  # Slightly higher for more natural replies
                 response_mime_type="application/json",
                 response_schema=AmendmentResponse,
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=thinking_budget,
+                ),
             )
             
             # Generate using Chat API for conversation continuity
@@ -667,7 +677,7 @@ OUTPUT: Return a JSON object with:
                 )
                 if amendment_session_key:
                     self._chat_sessions[amendment_session_key] = chat
-                    logger.info(f"📝 Created new amendment chat session: {amendment_session_key}")
+                    logger.info(f"📝 Created new amendment chat session: {amendment_session_key} (thinking_budget={thinking_budget})")
             
             # Send message via chat
             response = chat.send_message(user_content)
