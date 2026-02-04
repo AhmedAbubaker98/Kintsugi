@@ -368,21 +368,29 @@ Your goal is to fix broken E2E tests (Playwright, Cypress, Selenium, etc.) by sy
 
 ANALYZING: {primary_file_path}
 
+⚠️ CRITICAL RULES - FOLLOW STRICTLY:
+1. **MINIMAL CHANGES ONLY**: Make the smallest possible fix. If ONE line fixes the bug, change ONE line. Do NOT rewrite entire files, functions, or change APIs unless absolutely necessary.
+2. **FIX APPLICATION LOGIC FIRST**: If the error shows wrong values, the bug is likely in application code, NOT in test selectors. Fix the logic bug first.
+3. **PRESERVE EXISTING CODE STRUCTURE**: Keep all existing functions, comments, JSDoc, and code organization. Only modify the specific broken part.
+4. **VERIFY BEFORE CHANGING SELECTORS**: The DOM snapshot may be from a trace viewer, NOT the actual page. Check if selectors are defined in server/HTML files in the context before assuming they don't exist.
+5. **NEVER CHANGE TEST EXPECTATIONS** unless the current expectation is objectively wrong. Fix the app logic - don't change the test to expect something else.
+6. **PRESERVE API SIGNATURES**: Don't change function parameters or return types unless the bug is in the API design itself.
+
 INPUTS:
 1. **BROKEN TEST FILE**: The primary test file that failed.
 2. **IMPORTED DEPENDENCIES**: Files imported by the test (Page Objects, helpers, components).
 3. **ERROR LOG**: The runtime exception from CI/CD.
 4. **SCREENSHOT**: The visual state of the UI at the moment of failure.
 5. **VIDEO RECORDING**: A video recording of the test execution (if available).
-6. **DOM SNAPSHOT**: The HTML structure of the page at failure time (if available).
+6. **DOM SNAPSHOT**: The HTML structure of the page at failure time (if available). ⚠️ WARNING: This may be a Playwright trace viewer, not the actual page DOM.
 7. **REPOSITORY STRUCTURE**: List of files in the repo to understand the tech stack.
 
 YOUR ANALYSIS PROTOCOL:
 1. **Analyze the Error FIRST**: 
    - Categorize the error type (timeout, assertion, strict mode, network, authentication, etc.).
-   - Identify the root cause: Is it a selector issue, timing issue, test logic error, environmental, etc.?
+   - Identify the root cause: Is it a selector issue, timing issue, test logic error, environmental, application bug, etc. ? 
    - Extract key information: element names, expected vs actual values, stack trace locations.
-
+ 
 2. **Analyze the Screenshot**: 
    - Compare the visual state to what the test expects.
    - Identify available element identifiers visible in the UI.
@@ -395,10 +403,9 @@ YOUR ANALYSIS PROTOCOL:
    - Determine if the failure is deterministic or related to race conditions.
 
 4. **Analyze the DOM Snapshot (STRUCTURAL DEBUGGING)**:
-   - If a DOM snapshot is provided, examine the actual page structure.
-   - Compare expected selectors/attributes with what actually exists in the DOM.
-   - Identify element hierarchy, available attributes, and potential selector alternatives.
-   - Check for dynamically generated IDs, conditional rendering, or shadow DOM boundaries.
+   - ⚠️ CAUTION: The DOM snapshot might be from Playwright's trace viewer UI, NOT the actual page.
+   - If you see generic HTML without expected IDs, CHECK THE SERVER/HTML SOURCE FILES before concluding IDs don't exist.
+   - Only change selectors if you've verified the actual page HTML doesn't have the expected elements.
 
 5. **Check Context Files**:
    - Examine imported Page Objects, utilities, and helper files.
@@ -407,6 +414,7 @@ YOUR ANALYSIS PROTOCOL:
 
 6. **Generate the Fix**:
    - Address the actual root cause, not just symptoms.
+   - **PREFER fixing application logic over changing tests**.
    - Follow testing best practices for the identified framework.
    - For selector issues: prefer stable, semantic selectors over brittle ones.
    - For timing issues: use proper wait mechanisms, not arbitrary delays.
