@@ -65,18 +65,24 @@ class KintsugiFixMetadata(BaseModel):
 
 
 # Common test file patterns for different frameworks
+# These match STANDARDIZED test framework output formats
 FILE_PATTERNS = [
-    # Playwright
-    r'(?:at\s+)?([^\s:]+\.spec\.[jt]sx?)',
-    r'(?:at\s+)?([^\s:]+\.test\.[jt]sx?)',
-    # Cypress
-    r'(?:at\s+)?([^\s:]+\.cy\.[jt]sx?)',
-    # Python pytest
-    r'(?:File\s+["\'])?([^\s:"\']+test[^\s:"\']*\.py)',
-    r'(?:File\s+["\'])?([^\s:"\']+_test\.py)',
-    # Generic paths in errors
-    r'(?:in\s+|at\s+|from\s+)([^\s:()]+/tests?/[^\s:()]+\.[jt]sx?)',
-    r'(?:in\s+|at\s+|from\s+)([^\s:()]+/e2e/[^\s:()]+\.[jt]sx?)',
+    # Playwright standardized output: "1) [chromium] › tests/e2e/file.spec.js:10:5 › Suite › test"
+    r'\[(?:chromium|firefox|webkit)\]\s*›\s*([^\s:›]+\.(?:spec|test)\.[jt]sx?)(?::\d+)?',
+    # Playwright error stack: "at tests/e2e/file.spec.js:15:10"
+    r'at\s+([^\s:]+\.(?:spec|test)\.[jt]sx?):\d+',
+    # Jest standardized output: "FAIL tests/example.test.js" or "● Test Suite › test name"  
+    r'FAIL\s+([^\s]+\.(?:spec|test)\.[jt]sx?)',
+    r'●\s+([^\s]+\.(?:spec|test)\.[jt]sx?)',
+    # Cypress standardized: "Running: cypress/e2e/file.cy.js"
+    r'Running:\s*([^\s]+\.cy\.[jt]sx?)',
+    # Pytest standardized: "FAILED tests/test_file.py::test_name" or "tests/test_file.py:10: AssertionError"
+    r'FAILED\s+([^\s:]+\.py)(?:::|:)',
+    r'([^\s:]+_test\.py|[^\s:]+test_[^\s:]+\.py):\d+:',
+    # Mocha: "1) Suite name test name" followed by "at Context.<anonymous> (test/file.js:10:5)"
+    r'at\s+(?:Context\.<anonymous>|Object\.<anonymous>)\s*\(([^\s:)]+\.(?:spec|test)\.[jt]sx?):\d+',
+    # Generic error stack traces with test paths
+    r'(?:Error|AssertionError|TimeoutError)[^\n]*\n\s+at[^\n]*\n\s+at\s+([^\s:()]+/(?:tests?|e2e|spec|__tests__)/[^\s:()]+\.[jt]sx?):\d+',
 ]
 
 # CI/CD infrastructure failure patterns - Kintsugi should NOT try to fix these
@@ -220,40 +226,61 @@ class WorkflowProcessor:
             # Initialize evidence with defaults
             evidence = {"screenshot": None, "video": None, "dom_snapshot": None, "error_text": ""}
             broken_file_path = None
+            artifact_downloaded = False
             
             if artifacts:
+                # Log all available artifacts for debugging
+                artifact_names = [a["name"] for a in artifacts]
+                logger.info(f"📦 Available artifacts: {artifact_names}")
+                
                 # Find test-related artifacts (flexible pattern matching)
                 target_artifact = next(
                     (a for a in artifacts if any(
                         keyword in a["name"].lower() 
-                        for keyword in ["report", "results", "test", "playwright", "cypress", "jest", "pytest"]
+                        for keyword in ["report", "results", "test", "playwright", "cypress", "jest", "pytest", "evidence", "gauntlet", "artifact"]
                     )),
                     None
                 )
                 
                 if target_artifact:
-                    logger.info(f"📦 Found Artifact: {target_artifact['name']} (ID: {target_artifact['id']})")
+                    logger.info(f"📦 Selected Artifact: {target_artifact['name']} (ID: {target_artifact['id']})")
                     zip_content = await self.github.download_artifact(installation_id, owner, repo, target_artifact["id"])
                     
                     # Extract Evidence (screenshot + video + DOM + error log)
                     evidence = await self._extract_evidence(zip_content)
+                    artifact_downloaded = True
                     
                     # Dynamic File Discovery - Identify broken file from error log
                     broken_file_path = self._identify_broken_file(evidence["error_text"])
                 else:
-                    logger.warning("No test report artifact found in artifacts list.")
+                    logger.warning(f"No test report artifact matched patterns. Available: {artifact_names}")
             
-            # 5.5. If no artifacts or no error text, fetch workflow logs directly
-            if not evidence["error_text"]:
-                logger.info("📥 No artifact error log - fetching workflow run logs directly...")
-                try:
-                    workflow_logs = await self._fetch_workflow_logs(installation_id, owner, repo, run_id)
-                    if workflow_logs:
+            # 5.5. Fetch workflow logs (always needed for context, may also contain artifact ID)
+            workflow_logs = ""
+            try:
+                workflow_logs = await self._fetch_workflow_logs(installation_id, owner, repo, run_id)
+                if workflow_logs:
+                    logger.info(f"📜 Fetched {len(workflow_logs)} chars of workflow logs")
+                    
+                    # If no artifact was downloaded, try to find artifact ID in logs and download
+                    if not artifact_downloaded:
+                        artifact_id = self._parse_artifact_id_from_logs(workflow_logs)
+                        if artifact_id:
+                            logger.info(f"📦 Found artifact ID in logs: {artifact_id}")
+                            try:
+                                zip_content = await self.github.download_artifact(installation_id, owner, repo, artifact_id)
+                                evidence = await self._extract_evidence(zip_content)
+                                artifact_downloaded = True
+                                broken_file_path = self._identify_broken_file(evidence["error_text"])
+                            except Exception as e:
+                                logger.warning(f"Could not download artifact {artifact_id}: {e}")
+                    
+                    # Use workflow logs as error text if no artifact evidence
+                    if not evidence["error_text"]:
                         evidence["error_text"] = workflow_logs
-                        logger.info(f"📜 Fetched {len(workflow_logs)} chars of workflow logs")
-                except Exception as e:
-                    logger.warning(f"Could not fetch workflow logs: {e}")
-                    evidence["error_text"] = "No error log available."
+            except Exception as e:
+                logger.warning(f"Could not fetch workflow logs: {e}")
+                evidence["error_text"] = "No error log available."
             
             # 5.6. Check for CI infrastructure failures BEFORE proceeding
             is_infra_failure, infra_reason = self._is_infrastructure_failure(evidence["error_text"])
@@ -816,6 +843,40 @@ class WorkflowProcessor:
             await asyncio.sleep(2)
         return []
 
+    def _parse_artifact_id_from_logs(self, logs: str) -> int | None:
+        """
+        Parse artifact ID from workflow logs.
+        
+        GitHub Actions logs contain standardized output like:
+        "Artifact <name> has been successfully uploaded! ... Artifact ID is <id>"
+        "Artifact download URL: https://github.com/.../artifacts/<id>"
+        
+        Args:
+            logs: The workflow log content.
+        
+        Returns:
+            int | None: The artifact ID if found, None otherwise.
+        """
+        if not logs:
+            return None
+        
+        # Pattern 1: "Artifact ID is <number>"
+        match = re.search(r'Artifact ID is (\d+)', logs)
+        if match:
+            return int(match.group(1))
+        
+        # Pattern 2: "Artifact ID <number>"
+        match = re.search(r'Artifact ID (\d+)', logs)
+        if match:
+            return int(match.group(1))
+        
+        # Pattern 3: URL pattern "/artifacts/<number>"
+        match = re.search(r'/artifacts/(\d+)', logs)
+        if match:
+            return int(match.group(1))
+        
+        return None
+
     async def _determine_branch_strategy(
         self,
         token: str,
@@ -1108,18 +1169,25 @@ class WorkflowProcessor:
             )
             response.raise_for_status()
 
-    def _extract_error_summary(self, error_text: str, max_length: int = 200) -> str:
+    def _extract_error_summary(self, error_text: str, max_length: int = 500) -> str:
         """Extract a brief summary of the error for tracking."""
         if not error_text:
             return "No error text available"
         
-        # Look for common error patterns
+        # Skip truncation markers
+        error_text = error_text.replace("... [truncated] ...", "").strip()
+        
+        # Look for common error patterns (Playwright, Jest, pytest, etc.)
         patterns = [
             r'Error:?\s*(.+?)(?:\n|$)',
             r'AssertionError:?\s*(.+?)(?:\n|$)',
             r'TimeoutError:?\s*(.+?)(?:\n|$)',
             r'expect\(.+?\)\.(.+?)(?:\n|$)',
             r'Locator.+?failed(.+?)(?:\n|$)',
+            # Playwright specific patterns
+            r'(\d+\)\s+\[chromium\].+?─+.+?)(?:\n|$)',
+            r'(Timed out \d+ms waiting for.+?)(?:\n|$)',
+            r'(Expected:.+?Received:.+?)(?:\n|$)',
         ]
         
         for pattern in patterns:
