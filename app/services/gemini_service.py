@@ -88,6 +88,11 @@ class GeminiService:
         # Store active chat sessions for multi-turn conversations
         # Key: session_id (e.g., branch name), Value: Chat object
         self._chat_sessions: dict[str, any] = {}
+        
+        # Store uploaded video files per session to reuse across iterations
+        # Key: session_id, Value: types.File object
+        # Gemini File API files have 48-hour TTL, so they auto-expire if forgotten
+        self._session_videos: dict[str, any] = {}
 
     def _rotate_debug_file(self, directory: str, prefix: str, content: str):
         """
@@ -330,6 +335,12 @@ class GeminiService:
             if session_id and is_iteration and session_id in self._chat_sessions:
                 chat = self._chat_sessions[session_id]
                 logger.info(f"🔄 Continuing existing chat session: {session_id}")
+            
+            # Check for existing uploaded video in this session
+            existing_video = self._session_videos.get(session_id) if session_id else None
+            if existing_video:
+                logger.info(f"🎬 Reusing existing video from session: {existing_video.name}")
+                uploaded_video = existing_video
 
             # Build context sections
             context_files = context_files or {}
@@ -423,7 +434,13 @@ OUTPUT: Return a JSON object with:
             # Add video if available (must be uploaded to File API)
             if has_video:
                 logger.info("🎬 Processing video for temporal debugging...")
-                uploaded_video = self.upload_video(video_bytes, f"failure_{primary_file_path.replace('/', '_')}.webm")
+                # Only upload if we don't already have a video for this session
+                if not uploaded_video:
+                    uploaded_video = self.upload_video(video_bytes, f"failure_{primary_file_path.replace('/', '_')}.webm")
+                    # Store for future iterations in this session
+                    if uploaded_video and session_id:
+                        self._session_videos[session_id] = uploaded_video
+                        logger.info(f"💾 Video stored for session reuse: {session_id}")
                 if uploaded_video:
                     user_content.append(types.Part.from_uri(file_uri=uploaded_video.uri, mime_type="video/webm"))
                     logger.info("🎬 Video attached to analysis")
@@ -525,16 +542,14 @@ OUTPUT: Return a JSON object with:
             logger.error(f"❌ Gemini Generation Failed: {e}")
             raise
         
-        finally:
-            # Clean up uploaded video file
-            if uploaded_video:
-                logger.info(f"🧹 Cleaning up uploaded video: {uploaded_video.name}")
-                self.delete_file(uploaded_video.name)
+        # Note: Videos are NOT deleted here - they're kept for session reuse
+        # and cleaned up when clear_session() is called (on success or max attempts).
+        # Gemini File API files have 48-hour auto-expiry as a safety net.
 
     def clear_session(self, session_id: str) -> bool:
         """
         Clear a chat session when the fix is complete (success or max attempts).
-        Also clears any associated amendment sessions.
+        Also clears any associated amendment sessions and uploaded videos.
         
         Args:
             session_id: The session ID to clear (typically the branch name).
@@ -543,6 +558,14 @@ OUTPUT: Return a JSON object with:
             bool: True if any session was cleared, False if none found.
         """
         cleared = False
+        
+        # Clean up uploaded video for this session
+        if session_id in self._session_videos:
+            video = self._session_videos[session_id]
+            logger.info(f"🧹 Cleaning up session video: {video.name}")
+            self.delete_file(video.name)
+            del self._session_videos[session_id]
+            cleared = True
         
         # Clear main fix session
         if session_id in self._chat_sessions:
