@@ -62,6 +62,10 @@ class KintsugiFixMetadata(BaseModel):
     # Timestamps
     started_at: str = ""
     last_updated_at: str = ""
+    
+    # Transparent mode tracking (for live status updates)
+    transparent_pr_number: int | None = None
+    transparent_comment_id: int | None = None
 
 
 # Common test file patterns for different frameworks
@@ -83,6 +87,27 @@ FILE_PATTERNS = [
     r'at\s+(?:Context\.<anonymous>|Object\.<anonymous>)\s*\(([^\s:)]+\.(?:spec|test)\.[jt]sx?):\d+',
     # Generic error stack traces with test paths
     r'(?:Error|AssertionError|TimeoutError)[^\n]*\n\s+at[^\n]*\n\s+at\s+([^\s:()]+/(?:tests?|e2e|spec|__tests__)/[^\s:()]+\.[jt]sx?):\d+',
+]
+
+# Patterns to extract ALL source files mentioned in error logs (not just test files)
+# These help identify application code that may contain bugs
+SOURCE_FILE_PATTERNS = [
+    # Stack trace file paths: "at functionName (path/to/file.js:10:5)"
+    r'at\s+\w+\s*\(([^\s:()]+\.(?:js|ts|jsx|tsx|py|rb)):\d+:\d+\)',
+    # Stack trace without function name: "at path/to/file.js:10:5"
+    r'at\s+([^\s:()]+\.(?:js|ts|jsx|tsx|py|rb)):\d+:\d+',
+    # Import/require errors: "Cannot find module './path/to/file'"
+    r"Cannot find module ['\"]([^'\"]+)['\"]",
+    # File paths in error messages: "Error in /path/to/file.js"
+    r'(?:Error|Exception|Failed)\s+(?:in|at|from)\s+([^\s:]+\.(?:js|ts|jsx|tsx|py|rb))',
+    # Python traceback: "File "path/to/file.py", line 10"
+    r'File\s+"([^"]+\.py)",\s+line\s+\d+',
+    # Webpack/bundler errors: "Module build failed: path/to/file.js"
+    r'Module\s+(?:build\s+)?failed[^:]*:\s*([^\s:]+\.(?:js|ts|jsx|tsx))',
+    # General file paths with extensions in error context
+    r'["\']?(?:src|lib|app|pages|components|utils|logic)/[^\s:"\'\)]+\.(?:js|ts|jsx|tsx|py)["\']?',
+    # Playwright artifact paths: "test-results/t3-Level-3.../error-context.md" -> extract test name
+    r'test-results/([^-/]+)-[^/]+/(?:error|trace)',
 ]
 
 # CI/CD infrastructure failure patterns - Kintsugi should NOT try to fix these
@@ -359,10 +384,12 @@ class WorkflowProcessor:
 
             broken_file_content = base64.b64decode(file_data["content"]).decode("utf-8")
 
-            # 8. Smart Context Retrieval - Parse imports and fetch related files
+            # 8. Smart Context Retrieval - Parse imports AND extract files from error logs
             context_files = await self._fetch_context_files(
                 installation_id, owner, repo, fetch_branch,
-                broken_file_path, broken_file_content, repo_files
+                broken_file_path, broken_file_content, repo_files,
+                error_text=evidence["error_text"],  # Pass error log to extract mentioned source files
+                max_depth=config.limits.max_import_depth,  # Configurable depth for recursive imports
             )
             logger.info(f"📚 Fetched {len(context_files)} context files")
 
@@ -489,6 +516,23 @@ class WorkflowProcessor:
             commit_url = commit_response.get("html_url", "N/A")
             logger.info(f"✅ Committed {len(allowed_fixes)} file(s): {commit_url}")
 
+            # 17. TRANSPARENT MODE: Create/update draft PR with live status
+            if config.updates.mode == "transparent":
+                await self._handle_transparent_update(
+                    token=token,
+                    installation_id=installation_id,
+                    owner=owner,
+                    repo=repo,
+                    repo_full_name=repo_full_name,
+                    target_branch=target_branch,
+                    base_branch=base_branch,
+                    metadata=metadata,
+                    current_attempt=current_attempt,
+                    max_attempts=config.limits.max_attempts,
+                    is_first_attempt=not is_iteration,
+                    files_to_commit=files_to_commit,
+                )
+
             # 18. NO PR CREATION! Just log and wait for CI result
             logger.info(f"Fix pushed to '{target_branch}'. Waiting for CI...")
             logger.info(f"Attempt {current_attempt}/{config.limits.max_attempts}")
@@ -591,6 +635,73 @@ class WorkflowProcessor:
                 return True, matched_text
         
         return False, None
+
+    def _extract_files_from_error_log(self, error_text: str, repo_files: list[str]) -> list[str]:
+        """
+        Extract ALL file paths mentioned in error logs (test files AND source files).
+        
+        This is crucial for finding application code bugs - the error log often mentions
+        source files in stack traces that contain the actual bug.
+        
+        Args:
+            error_text: The error log content.
+            repo_files: List of files in the repository (for validation).
+        
+        Returns:
+            list[str]: List of file paths that exist in the repo and were mentioned in errors.
+        """
+        if not error_text:
+            return []
+        
+        found_files = set()
+        repo_files_set = set(repo_files)
+        repo_files_lower = {f.lower(): f for f in repo_files}  # For case-insensitive matching
+        
+        # Search with both FILE_PATTERNS (test files) and SOURCE_FILE_PATTERNS (source files)
+        all_patterns = FILE_PATTERNS + SOURCE_FILE_PATTERNS
+        
+        for pattern in all_patterns:
+            try:
+                matches = re.findall(pattern, error_text, re.IGNORECASE)
+                for match in matches:
+                    # Clean up the path
+                    file_path = match.strip().strip("'\"")
+                    file_path = re.sub(r':\d+:\d+$', '', file_path)  # Remove :line:col
+                    file_path = re.sub(r':\d+$', '', file_path)  # Remove :line
+                    file_path = file_path.lstrip('./')  # Remove leading ./
+                    
+                    # Skip if it's a node_modules or obvious non-project file
+                    if 'node_modules' in file_path or file_path.startswith('/'):
+                        continue
+                    
+                    # Handle short test names extracted from artifact paths (e.g., "t3")
+                    # These need to be resolved to actual test files
+                    if re.match(r'^[a-zA-Z0-9_-]+$', file_path) and '.' not in file_path:
+                        # This is likely a test name hint, search for matching test file
+                        for repo_file in repo_files:
+                            fname = os.path.basename(repo_file).lower()
+                            if fname.startswith(file_path.lower()) and any(ext in fname for ext in ['.spec.', '.test.', '.cy.', '_test.', 'test_']):
+                                found_files.add(repo_file)
+                                logger.debug(f"  Resolved test hint '{file_path}' -> '{repo_file}'")
+                                break
+                        continue
+                    
+                    # Check if file exists in repo (exact or case-insensitive)
+                    if file_path in repo_files_set:
+                        found_files.add(file_path)
+                    elif file_path.lower() in repo_files_lower:
+                        found_files.add(repo_files_lower[file_path.lower()])
+                    else:
+                        # Try partial matching for paths like "logic/currency-math.js"
+                        for repo_file in repo_files:
+                            if repo_file.endswith(file_path) or file_path in repo_file:
+                                found_files.add(repo_file)
+                                break
+            except Exception as e:
+                logger.debug(f"Pattern {pattern[:30]}... failed: {e}")
+        
+        logger.info(f"📑 Extracted {len(found_files)} files from error log: {list(found_files)}")
+        return list(found_files)
 
     def _identify_broken_file(self, error_text: str) -> str | None:
         """
@@ -805,9 +916,12 @@ class WorkflowProcessor:
         broken_file_path: str,
         broken_file_content: str,
         repo_files: list[str],
+        error_text: str = "",
+        max_depth: int = 3,
     ) -> dict[str, str]:
         """
-        Fetch imported files to provide context to Gemini.
+        Fetch imported files AND files mentioned in error logs to provide context to Gemini.
+        Recursively fetches transitive imports (imports of imports).
         
         Args:
             installation_id: GitHub App installation ID.
@@ -817,47 +931,74 @@ class WorkflowProcessor:
             broken_file_path: Path of the broken test file.
             broken_file_content: Content of the broken test file.
             repo_files: List of all files in the repository.
+            error_text: Error log content (to extract mentioned source files).
+            max_depth: Maximum depth for transitive imports (default 3).
         
         Returns:
             dict[str, str]: Dictionary mapping file paths to their contents.
         """
         context_files = {}
+        files_to_process = [(broken_file_path, broken_file_content, 0)]  # (path, content, depth)
+        processed_files = {broken_file_path}  # Track processed to avoid cycles
         
-        # Parse imports from the broken file
-        imports = self._parse_imports(broken_file_content, broken_file_path)
+        # FIRST: Extract files mentioned in error logs and queue them for fetching
+        # This is crucial - error logs often mention source files that contain bugs
+        if error_text:
+            error_mentioned_files = self._extract_files_from_error_log(error_text, repo_files)
+            for file_path in error_mentioned_files:
+                if file_path not in processed_files and file_path != broken_file_path:
+                    processed_files.add(file_path)
+                    logger.info(f"  📋 Will fetch error-mentioned file: {file_path}")
+                    # Fetch immediately and add to queue for import processing
+                    try:
+                        file_data = await self.github.get_repository_content(
+                            installation_id, owner, repo, file_path, ref=branch
+                        )
+                        if file_data and "content" in file_data:
+                            content = base64.b64decode(file_data["content"]).decode("utf-8")
+                            context_files[file_path] = content
+                            # Also process imports from error-mentioned files
+                            files_to_process.append((file_path, content, 1))
+                    except Exception as e:
+                        logger.warning(f"Could not fetch error-mentioned file {file_path}: {e}")
         
-        # Resolve import paths to actual files
-        files_to_fetch = []
-        for imp in imports:
-            resolved = self._resolve_import_path(imp, broken_file_path, repo_files)
-            if resolved and resolved not in files_to_fetch:
-                files_to_fetch.append(resolved)
-                logger.info(f"  ✓ Resolved '{imp}' -> '{resolved}'")
-            elif not resolved:
-                logger.warning(f"  ✗ Could not resolve '{imp}' in repo files")
+        # THEN: Process imports recursively
+        while files_to_process:
+            current_path, current_content, depth = files_to_process.pop(0)
+            
+            if depth >= max_depth:
+                logger.debug(f"  Max depth {max_depth} reached for {current_path}")
+                continue
+            
+            # Parse imports from current file
+            imports = self._parse_imports(current_content, current_path)
+            
+            # Resolve import paths to actual files
+            for imp in imports:
+                resolved = self._resolve_import_path(imp, current_path, repo_files)
+                if resolved and resolved not in processed_files:
+                    processed_files.add(resolved)
+                    logger.info(f"  ✓ Resolved '{imp}' -> '{resolved}' (depth {depth + 1})")
+                    
+                    # Fetch the file
+                    try:
+                        file_data = await self.github.get_repository_content(
+                            installation_id, owner, repo, resolved, ref=branch
+                        )
+                        if file_data and "content" in file_data:
+                            content = base64.b64decode(file_data["content"]).decode("utf-8")
+                            context_files[resolved] = content
+                            
+                            # Queue for transitive import processing
+                            files_to_process.append((resolved, content, depth + 1))
+                    except Exception as e:
+                        logger.warning(f"Could not fetch context file {resolved}: {e}")
+                elif resolved:
+                    logger.debug(f"  ✓ Already processed: {resolved}")
+                elif not resolved:
+                    logger.warning(f"  ✗ Could not resolve '{imp}' from '{current_path}'")
         
-        logger.info(f"📚 Will fetch {len(files_to_fetch)} dependency files: {files_to_fetch}")
-        
-        # Fetch files in parallel
-        async def fetch_file(file_path: str) -> tuple[str, str | None]:
-            try:
-                file_data = await self.github.get_repository_content(
-                    installation_id, owner, repo, file_path, ref=branch
-                )
-                if file_data and "content" in file_data:
-                    content = base64.b64decode(file_data["content"]).decode("utf-8")
-                    return (file_path, content)
-            except Exception as e:
-                logger.warning(f"Could not fetch context file {file_path}: {e}")
-            return (file_path, None)
-        
-        # Fetch all files concurrently
-        results = await asyncio.gather(*[fetch_file(f) for f in files_to_fetch])
-        
-        for file_path, content in results:
-            if content:
-                context_files[file_path] = content
-        
+        logger.info(f"📚 Fetched {len(context_files)} context files (including transitive): {list(context_files.keys())}")
         return context_files
 
     async def _get_artifacts_with_retry(
@@ -1234,6 +1375,192 @@ class WorkflowProcessor:
         
         return "Unknown error"
 
+    async def _handle_transparent_update(
+        self,
+        token: str,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        repo_full_name: str,
+        target_branch: str,
+        base_branch: str,
+        metadata: KintsugiFixMetadata,
+        current_attempt: int,
+        max_attempts: int,
+        is_first_attempt: bool,
+        files_to_commit: dict[str, str],
+    ):
+        """
+        Handle transparent mode updates: create/update draft PR with live status.
+        
+        In transparent mode:
+        - First attempt: Create a draft PR and status comment
+        - Subsequent attempts: Update the existing status comment
+        """
+        try:
+            if is_first_attempt:
+                # Create draft PR
+                pr_body = self._build_transparent_pr_body(metadata, current_attempt, max_attempts, "in_progress")
+                
+                pr_response = await self.github.create_pull_request(
+                    token=token,
+                    repo_full_name=repo_full_name,
+                    title=f"🔧 Kintsugi Fix In Progress: {metadata.primary_file}",
+                    body=pr_body,
+                    head=target_branch,
+                    base=base_branch,
+                    draft=True,
+                )
+                
+                pr_number = pr_response.get("number")
+                pr_url = pr_response.get("html_url", "N/A")
+                logger.info(f"📝 Transparent mode: Draft PR #{pr_number} created: {pr_url}")
+                
+                # Create status comment on the PR
+                comment_body = self._build_status_comment(metadata, current_attempt, max_attempts, "in_progress")
+                comment_response = await self.github.create_pr_comment(
+                    installation_id=installation_id,
+                    owner=owner,
+                    repo=repo,
+                    pull_number=pr_number,
+                    body=comment_body,
+                )
+                comment_id = comment_response.get("id")
+                logger.info(f"💬 Transparent mode: Status comment #{comment_id} created")
+                
+                # Update metadata with PR and comment IDs for future updates
+                metadata.transparent_pr_number = pr_number
+                metadata.transparent_comment_id = comment_id
+                
+                # Re-commit metadata with the new IDs
+                metadata_content = metadata.model_dump_json(indent=2)
+                await self.github.push_commit(
+                    installation_id=installation_id,
+                    owner=owner,
+                    repo=repo,
+                    branch=target_branch,
+                    message="chore(kintsugi): update metadata with transparent mode IDs",
+                    files={".kintsugi/fix_metadata.json": metadata_content},
+                )
+                
+            else:
+                # Update existing status comment
+                if metadata.transparent_pr_number and metadata.transparent_comment_id:
+                    comment_body = self._build_status_comment(metadata, current_attempt, max_attempts, "in_progress")
+                    await self.github.update_pr_comment(
+                        installation_id=installation_id,
+                        owner=owner,
+                        repo=repo,
+                        comment_id=metadata.transparent_comment_id,
+                        body=comment_body,
+                    )
+                    logger.info(f"💬 Transparent mode: Updated status comment #{metadata.transparent_comment_id}")
+                else:
+                    logger.warning("⚠️ Transparent mode: No PR/comment IDs in metadata, cannot update status")
+                    
+        except Exception as e:
+            logger.error(f"❌ Transparent mode update failed: {e}", exc_info=True)
+            # Don't fail the whole process if transparent updates fail
+
+    def _build_transparent_pr_body(
+        self,
+        metadata: KintsugiFixMetadata,
+        current_attempt: int,
+        max_attempts: int,
+        status: str,
+    ) -> str:
+        """Build the PR body for transparent mode."""
+        status_emoji = {"in_progress": "🔄", "success": "✅", "failed": "❌"}.get(status, "❓")
+        
+        return f"""## {status_emoji} Kintsugi Auto-Fix
+
+| | |
+|---|---|
+| **Status** | {status.replace('_', ' ').title()} |
+| **Attempt** | {current_attempt}/{max_attempts} |
+| **File** | `{metadata.primary_file}` |
+
+---
+
+### 📊 Live Status
+
+Check the status comment below for real-time progress updates.
+
+This PR is a **draft** while Kintsugi iterates on fixes. It will be marked ready for review when:
+- ✅ All tests pass (success)
+- ❌ Max attempts exhausted (needs human review)
+
+---
+*Generated by [Kintsugi](https://github.com/AhmedAbubaker98/Kintsugi) - Transparent Mode*
+"""
+
+    def _build_status_comment(
+        self,
+        metadata: KintsugiFixMetadata,
+        current_attempt: int,
+        max_attempts: int,
+        status: str,
+    ) -> str:
+        """Build the status comment for transparent mode updates."""
+        status_emoji = {"in_progress": "🔄", "success": "✅", "failed": "❌"}.get(status, "❓")
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        
+        # Build attempt history
+        attempts_list = []
+        for attempt in metadata.attempts:
+            attempt_time = attempt.timestamp[:16] if attempt.timestamp else "N/A"
+            files = ", ".join(f"`{f}`" for f in attempt.files_changed[:2])
+            if len(attempt.files_changed) > 2:
+                files += f" +{len(attempt.files_changed) - 2} more"
+            attempts_list.append(f"| {attempt.attempt_number} | {attempt_time} | {attempt.error_summary[:40]}... | {files} |")
+        
+        attempts_table = "| # | Time | Error | Files |\n|---|------|-------|-------|\n" + "\n".join(attempts_list) if attempts_list else "*No attempts yet*"
+        
+        # Evidence used
+        evidence_items = []
+        if metadata.evidence_used.screenshot:
+            evidence_items.append("📸 Screenshot")
+        if metadata.evidence_used.video:
+            evidence_items.append("🎬 Video")
+        if metadata.evidence_used.dom_snapshot:
+            evidence_items.append("🌐 DOM Snapshot")
+        if metadata.evidence_used.error_log:
+            evidence_items.append("📋 Error Log")
+        evidence_text = " • ".join(evidence_items) if evidence_items else "None available"
+        
+        return f"""## {status_emoji} Kintsugi Fix Status
+
+**Last Updated:** {now}
+
+| | |
+|---|---|
+| **Status** | {status.replace('_', ' ').title()} |
+| **Current Attempt** | {current_attempt}/{max_attempts} |
+| **Primary File** | `{metadata.primary_file}` |
+| **Evidence Used** | {evidence_text} |
+
+---
+
+### 🧠 Current Approach
+
+{metadata.explanation or "*Analyzing...*"}
+
+---
+
+### 📋 Attempt History
+
+{attempts_table}
+
+---
+
+### ⏳ What's Next
+
+{"**Waiting for CI results...** The next update will appear when CI completes." if status == "in_progress" else ""}
+
+---
+*This comment is automatically updated. Last refresh: {now}*
+"""
+
     async def _handle_max_attempts_reached(
         self,
         token: str,
@@ -1251,22 +1578,15 @@ class WorkflowProcessor:
         """
         logger.info("🚨 Opening PR with failure report (max attempts exhausted)")
         
-        # Check if PR already exists for this branch
-        existing_pr = await self._find_pr_for_branch(token, repo_full_name, branch)
-        if existing_pr:
-            pr_number = existing_pr.get("number")
-            pr_url = existing_pr.get("html_url", "N/A")
-            logger.info(f"PR #{pr_number} already exists - skipping duplicate PR creation: {pr_url}")
-            # Clean up the chat session since we're done
-            self.gemini.clear_session(branch)
-            return
-        
         # Fetch metadata for the report
         metadata = await self._fetch_metadata(installation_id, owner, repo, branch)
         
         if not metadata:
             logger.error("No metadata found for failure report")
             return
+        
+        # Check if PR already exists for this branch
+        existing_pr = await self._find_pr_for_branch(token, repo_full_name, branch)
         
         # Build failure PR body
         attempts_table = self._build_attempts_table(metadata.attempts)
@@ -1319,17 +1639,58 @@ This likely indicates a more complex issue that requires human review.
 *Generated by [Kintsugi](https://github.com/AhmedAbubaker98/Kintsugi) - The Autonomous QA Orchestrator*
 """
         
-        pr_response = await self.github.create_pull_request(
-            token=token,
-            repo_full_name=repo_full_name,
-            title=f"🚨 Kintsugi Needs Help: {metadata.primary_file}",
-            body=pr_body,
-            head=branch,
-            base=metadata.base_branch,
-        )
-        
-        pr_url = pr_response.get("html_url", "N/A")
-        logger.info(f"🚨 Failure PR opened: {pr_url}")
+        if existing_pr and config.updates.mode == "transparent" and metadata.transparent_pr_number:
+            # Transparent mode: Update existing draft PR with failure report
+            pr_number = existing_pr.get("number")
+            logger.info(f"📝 Transparent mode: Updating PR #{pr_number} with failure report")
+            
+            await self.github.update_pull_request(
+                installation_id=installation_id,
+                owner=owner,
+                repo=repo,
+                pull_number=pr_number,
+                title=f"🚨 Kintsugi Needs Help: {metadata.primary_file}",
+                body=pr_body,
+            )
+            
+            # Update the status comment with failure
+            if metadata.transparent_comment_id:
+                comment_body = self._build_status_comment(
+                    metadata,
+                    len(metadata.attempts),
+                    config.limits.max_attempts,
+                    "failed"
+                )
+                await self.github.update_pr_comment(
+                    installation_id=installation_id,
+                    owner=owner,
+                    repo=repo,
+                    comment_id=metadata.transparent_comment_id,
+                    body=comment_body,
+                )
+            
+            pr_url = existing_pr.get("html_url", "N/A")
+            logger.info(f"🚨 Failure report updated on PR #{pr_number}: {pr_url}")
+            
+        elif existing_pr:
+            # Silent mode with existing PR - skip
+            pr_number = existing_pr.get("number")
+            pr_url = existing_pr.get("html_url", "N/A")
+            logger.info(f"PR #{pr_number} already exists - skipping duplicate PR creation: {pr_url}")
+            
+        else:
+            # No PR exists - Create new failure PR
+            pr_response = await self.github.create_pull_request(
+                token=token,
+                repo_full_name=repo_full_name,
+                title=f"🚨 Kintsugi Needs Help: {metadata.primary_file}",
+                body=pr_body,
+                head=branch,
+                base=metadata.base_branch,
+            )
+            
+            pr_url = pr_response.get("html_url", "N/A")
+            logger.info(f"🚨 Failure PR opened: {pr_url}")
         
         # Clean up the chat session since we're done with this fix
         self.gemini.clear_session(branch)
@@ -1569,48 +1930,83 @@ This likely indicates a more complex issue that requires human review.
             
             logger.info(f"🎉 SUCCESS on branch '{branch}'! Creating verified PR...")
             
-            # Check if PR already exists (in case of re-runs)
-            existing_pr = await self._find_pr_for_branch(token, repo_full_name, branch)
-            if existing_pr:
-                # PR exists - the detailed PR report already conveys success
-                # No need for redundant "All Tests Passing" comments
-                pr_number = existing_pr.get("number")
-                logger.info(f"PR #{pr_number} already exists - skipping (PR report is sufficient)")
-                return
-            
-            # No PR exists - THIS IS THE MAGIC MOMENT! Create the verified PR
+            # Fetch metadata for the PR report
             metadata = await self._fetch_metadata(installation_id, owner, repo, branch)
             
-            if not metadata:
-                logger.warning(f"No metadata found for branch '{branch}'. Creating basic PR.")
-                # Fallback to basic PR
-                await self.github.create_pull_request(
-                    token=token,
-                    repo_full_name=repo_full_name,
-                    title=f"✅ Kintsugi Auto-Fix (Verified)",
-                    body="Tests are passing! This fix was verified by CI.",
-                    head=branch,
-                    base="main",
+            # Check if this is a transparent mode PR that needs to be updated
+            existing_pr = await self._find_pr_for_branch(token, repo_full_name, branch)
+            
+            if existing_pr and config.updates.mode == "transparent" and metadata and metadata.transparent_pr_number:
+                # Transparent mode: Update existing draft PR to ready-for-review
+                pr_number = existing_pr.get("number")
+                logger.info(f"📝 Transparent mode: Updating PR #{pr_number} to ready-for-review")
+                
+                # Update PR body with success report
+                pr_body = self._build_success_pr_body(metadata)
+                await self.github.update_pull_request(
+                    installation_id=installation_id,
+                    owner=owner,
+                    repo=repo,
+                    pull_number=pr_number,
+                    title=f"✅ Kintsugi Verified Fix: {metadata.primary_file}",
+                    body=pr_body,
                 )
-                return
-            
-            # Build the HIGH-FIDELITY PR report
-            pr_body = self._build_success_pr_body(metadata)
-            
-            pr_response = await self.github.create_pull_request(
-                token=token,
-                repo_full_name=repo_full_name,
-                title=f"✅ Kintsugi Verified Fix: {metadata.primary_file}",
-                body=pr_body,
-                head=branch,
-                base=metadata.base_branch,
-            )
-            
-            pr_url = pr_response.get("html_url", "N/A")
-            logger.info(f"🎉 VERIFIED PR OPENED! URL: {pr_url}")
+                
+                # Update the status comment with success
+                if metadata.transparent_comment_id:
+                    comment_body = self._build_status_comment(
+                        metadata,
+                        len(metadata.attempts),
+                        config.limits.max_attempts,
+                        "success"
+                    )
+                    await self.github.update_pr_comment(
+                        installation_id=installation_id,
+                        owner=owner,
+                        repo=repo,
+                        comment_id=metadata.transparent_comment_id,
+                        body=comment_body,
+                    )
+                
+                pr_url = existing_pr.get("html_url", "N/A")
+                logger.info(f"🎉 VERIFIED! PR #{pr_number} updated and ready for review: {pr_url}")
+                
+            elif existing_pr:
+                # PR exists but not transparent mode - skip
+                pr_number = existing_pr.get("number")
+                logger.info(f"PR #{pr_number} already exists - skipping (PR report is sufficient)")
+                
+            else:
+                # No PR exists - Create new verified PR (silent mode)
+                if not metadata:
+                    logger.warning(f"No metadata found for branch '{branch}'. Creating basic PR.")
+                    # Fallback to basic PR
+                    await self.github.create_pull_request(
+                        token=token,
+                        repo_full_name=repo_full_name,
+                        title=f"✅ Kintsugi Auto-Fix (Verified)",
+                        body="Tests are passing! This fix was verified by CI.",
+                        head=branch,
+                        base="main",
+                    )
+                else:
+                    # Build the HIGH-FIDELITY PR report
+                    pr_body = self._build_success_pr_body(metadata)
+                    
+                    pr_response = await self.github.create_pull_request(
+                        token=token,
+                        repo_full_name=repo_full_name,
+                        title=f"✅ Kintsugi Verified Fix: {metadata.primary_file}",
+                        body=pr_body,
+                        head=branch,
+                        base=metadata.base_branch,
+                    )
+                    
+                    pr_url = pr_response.get("html_url", "N/A")
+                    logger.info(f"🎉 VERIFIED PR OPENED! URL: {pr_url}")
             
             # Clean up metadata file if configured
-            if config.cleanup_metadata:
+            if config.cleanup_metadata and metadata:
                 await self._cleanup_metadata_file(installation_id, owner, repo, branch)
             
             # Clean up the chat session since we're done with this fix
@@ -1801,7 +2197,8 @@ Helping developers do more of what they love by automating the tedious parts of 
             for file_path, content in changed_files.items():
                 file_context = await self._fetch_context_files(
                     installation_id, owner, repo, head_branch,
-                    file_path, content, repo_files
+                    file_path, content, repo_files,
+                    max_depth=config.limits.max_import_depth,
                 )
                 context_files.update(file_context)
             
