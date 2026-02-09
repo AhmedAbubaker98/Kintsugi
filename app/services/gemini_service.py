@@ -470,15 +470,13 @@ OUTPUT: Return a JSON object with:
                 # For iterations, remind the model about previous attempt
                 if media_parts:
                     final_instruction = (
-                        f"⚠️ ITERATION: The previous fix did NOT work. Here is the NEW error after your last attempt.\n\n"
+                        f"⚠️ ITERATION: A. The previous fix did NOT work. Or B. there are new/different issues. Here is the NEW error after your last attempt.\n\n"
                         f"Analyze the NEW error log, {', and '.join(media_parts)}, and generate a DIFFERENT fix. "
-                        f"Your previous approach failed - try something else. Return JSON."
                     )
                 else:
                     final_instruction = (
-                        f"⚠️ ITERATION: The previous fix did NOT work. Here is the NEW error after your last attempt.\n\n"
+                        f"⚠️ ITERATION: A. The previous fix did NOT work. Or B. there are new/different issues. Here is the NEW error after your last attempt.\n\n"
                         f"Analyze the NEW error log and code, and generate a DIFFERENT fix. "
-                        f"Your previous approach failed - try something else. Return JSON."
                     )
             else:
                 if media_parts:

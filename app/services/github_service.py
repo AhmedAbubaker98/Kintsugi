@@ -467,6 +467,38 @@ class GitHubService:
             response.raise_for_status()
             return response.json()
     
+    async def update_pr_comment(
+        self,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        comment_id: int,
+        body: str,
+    ) -> dict[str, Any]:
+        """
+        Update an existing comment on a pull request.
+        
+        Args:
+            installation_id: The GitHub App installation ID.
+            owner: Repository owner.
+            repo: Repository name.
+            comment_id: The ID of the comment to update.
+            body: New comment body (Markdown supported).
+        
+        Returns:
+            dict: The updated comment metadata.
+        """
+        logger.debug(f"Updating comment {comment_id} on {owner}/{repo}")
+        token = await self.get_installation_token(installation_id)
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{self.base_url}/repos/{owner}/{repo}/issues/comments/{comment_id}",
+                headers=self._install_headers(token),
+                json={"body": body},
+            )
+            response.raise_for_status()
+            return response.json()
+    
     async def get_pull_request(
         self,
         installation_id: int,
@@ -492,6 +524,47 @@ class GitHubService:
             response = await client.get(
                 f"{self.base_url}/repos/{owner}/{repo}/pulls/{pull_number}",
                 headers=self._install_headers(token),
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def update_pull_request(
+        self,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        pull_number: int,
+        title: Optional[str] = None,
+        body: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Update a pull request's title or body.
+        
+        Args:
+            installation_id: The GitHub App installation ID.
+            owner: Repository owner.
+            repo: Repository name.
+            pull_number: Pull request number.
+            title: New PR title (optional).
+            body: New PR body (optional).
+        
+        Returns:
+            dict: Updated pull request metadata.
+        """
+        logger.debug(f"Updating PR: {owner}/{repo}#{pull_number}")
+        token = await self.get_installation_token(installation_id)
+        
+        payload = {}
+        if title is not None:
+            payload["title"] = title
+        if body is not None:
+            payload["body"] = body
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{self.base_url}/repos/{owner}/{repo}/pulls/{pull_number}",
+                headers=self._install_headers(token),
+                json=payload,
             )
             response.raise_for_status()
             return response.json()
@@ -606,7 +679,8 @@ class GitHubService:
         title: str,
         body: str,
         head: str,
-        base: str
+        base: str,
+        draft: bool = False,
     ) -> dict[str, Any]:
         """
         Opens a Pull Request.
@@ -618,6 +692,7 @@ class GitHubService:
             body: PR description/body.
             head: Source branch (the branch with changes).
             base: Target branch (where changes will be merged).
+            draft: If True, create as a draft PR.
         
         Returns:
             dict: Pull request creation response from GitHub API.
@@ -629,10 +704,11 @@ class GitHubService:
             "title": title,
             "body": body,
             "head": head,
-            "base": base
+            "base": base,
+            "draft": draft,
         }
 
-        logger.debug(f"Creating PR: {head} -> {base}")
+        logger.debug(f"Creating PR: {head} -> {base} (draft={draft})")
         async with httpx.AsyncClient() as client:
             response = await client.post(url, headers=headers, json=payload)
             response.raise_for_status()

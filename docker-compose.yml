@@ -21,27 +21,8 @@ services:
   # ==========================================================================
   # Receives GitHub webhooks, validates signatures, and enqueues jobs
   web:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: kintsugi-web
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    environment:
-      - DEBUG=true
-    volumes:
-      # Mount source code for hot reloading during development
-      - ./app:/app/app
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+    build: 
+    
 
   # ==========================================================================
   # WORKER SERVICE (Consumer)
@@ -60,6 +41,11 @@ services:
     volumes:
       # Mount source code for development (worker auto-restarts on changes)
       - ./app:/app/app
+      # Mount debug directories to persist prompts/outputs to host
+      - ./debug_prompts:/app/debug_prompts
+      - ./debug_outputs:/app/debug_outputs
+      - ./debug_screenshots:/app/debug_screenshots
+      - ./debug_videos:/app/debug_videos
     restart: unless-stopped
     # Worker depends on web starting first (ensures Redis URL is valid)
     depends_on:

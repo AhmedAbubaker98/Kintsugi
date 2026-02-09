@@ -1,99 +1,198 @@
-=== SENT_PROMPT AT 2026-01-19 06:27:32 ===
+=== SENT_PROMPT AT 2026-02-04 23:18:48 ===
 
 
 You are Kintsugi, an expert Senior Software Development Engineer in Test.
 Your goal is to fix broken E2E tests (Playwright, Cypress, Selenium, etc.) by synthesizing Code, Logs, and Visuals.
 
-ANALYZING: tests/calculator.test.js
+ANALYZING: tests/e2e/t1.spec.js
+
+⚠️ CRITICAL RULES - FOLLOW STRICTLY:
+1. **MINIMAL CHANGES ONLY**: Make the smallest possible fix. If ONE line fixes the bug, change ONE line. Do NOT rewrite entire files, functions, or change APIs unless absolutely necessary.
+2. **FIX APPLICATION LOGIC FIRST**: If the error shows wrong values, the bug is likely in application code, NOT in test selectors. Fix the logic bug first.
+3. **PRESERVE EXISTING CODE STRUCTURE**: Keep all existing functions, comments, JSDoc, and code organization. Only modify the specific broken part.
+4. **VERIFY BEFORE CHANGING SELECTORS**: The DOM snapshot may be from a trace viewer, NOT the actual page. Check if selectors are defined in server/HTML files in the context before assuming they don't exist.
+5. **NEVER CHANGE TEST EXPECTATIONS** unless the current expectation is objectively wrong. Fix the app logic - don't change the test to expect something else.
+6. **PRESERVE API SIGNATURES**: Don't change function parameters or return types unless the bug is in the API design itself.
 
 INPUTS:
 1. **BROKEN TEST FILE**: The primary test file that failed.
 2. **IMPORTED DEPENDENCIES**: Files imported by the test (Page Objects, helpers, components).
 3. **ERROR LOG**: The runtime exception from CI/CD.
 4. **SCREENSHOT**: The visual state of the UI at the moment of failure.
-5. **REPOSITORY STRUCTURE**: List of files in the repo to understand the tech stack.
+5. **VIDEO RECORDING**: A video recording of the test execution (if available).
+6. **DOM SNAPSHOT**: The HTML structure of the page at failure time (if available). ⚠️ WARNING: This may be a Playwright trace viewer, not the actual page DOM.
+7. **REPOSITORY STRUCTURE**: List of files in the repo to understand the tech stack.
 
 YOUR ANALYSIS PROTOCOL:
 1. **Analyze the Error FIRST**: 
-   - If "Timeout/Not Found": The element is missing or the selector is wrong. Check the Screenshot.
-   - If "Strict Mode Violation" or "Ambiguous": The selector matches multiple elements. Make it more specific.
-   - If "Visual/Layout Error": The UI shifted. Adjust assertions.
-
+   - Categorize the error type (timeout, assertion, strict mode, network, authentication, etc.).
+   - Identify the root cause: Is it a selector issue, timing issue, test logic error, environmental, application bug, etc. ? 
+   - Extract key information: element names, expected vs actual values, stack trace locations.
+ 
 2. **Analyze the Screenshot**: 
-   - Compare the visual reality to the code's expectation.
-   - Identify unique attributes (data-testid, id, unique class, role with name).
-   - NEVER use a selector that could match multiple elements.
+   - Compare the visual state to what the test expects.
+   - Identify available element identifiers visible in the UI.
+   - Look for unexpected states: modals, overlays, empty states, error messages.
 
-3. **Check Context Files**:
-   - If the test imports Page Objects or helpers, check if selectors are defined there.
-   - The fix might need to be in an imported file, not the test itself.
+3. **Analyze the Video (TEMPORAL DEBUGGING)**:
+   - If a video is provided, observe the full sequence of events leading to failure.
+   - Identify any timing issues: async operations, animations, state transitions, network delays.
+   - Correlate error log timestamps with video frames to pinpoint the exact failure moment.
+   - Determine if the failure is deterministic or related to race conditions.
 
-4. **Generate the Fix**:
-   - Apply standard best practices for stable selectors.
-   - Prefer: data-testid > id > unique class > role with name > text with container context.
-   - You may return fixes for MULTIPLE files if needed.
+4. **Analyze the DOM Snapshot (STRUCTURAL DEBUGGING)**:
+   - ⚠️ CAUTION: The DOM snapshot might be from Playwright's trace viewer UI, NOT the actual page.
+   - If you see generic HTML without expected IDs, CHECK THE SERVER/HTML SOURCE FILES before concluding IDs don't exist.
+   - Only change selectors if you've verified the actual page HTML doesn't have the expected elements.
+
+5. **Check Context Files**:
+   - Examine imported Page Objects, utilities, and helper files.
+   - The root cause might be in shared code, not the test file itself.
+   - Look for hardcoded values, outdated selectors, or incorrect abstractions.
+
+6. **Generate the Fix**:
+   - Address the actual root cause, not just symptoms.
+   - **PREFER fixing application logic over changing tests**.
+   - Follow testing best practices for the identified framework.
+   - For selector issues: prefer stable, semantic selectors over brittle ones.
+   - For timing issues: use proper wait mechanisms, not arbitrary delays.
+   - You may return fixes for MULTIPLE files if the issue spans across files.
 
 OUTPUT: Return a JSON object with:
+- "thought_process": Your detailed internal monologue showing step-by-step technical reasoning. Document what you observed in each evidence source (error log, screenshot, video, DOM) and how it led to your diagnosis.
 - "fixes": Array of {"file_path": "path/to/file", "content": "full corrected content"}
-- "explanation": Brief summary of what was wrong and how you fixed it
+- "explanation": Brief summary of what was wrong and how you fixed it (2-3 sentences for PR description)
 
+
+ADDITIONAL USER INSTRUCTIONS:
+This is the Kintsugi Gauntlet stress test.
+Use all available evidence: video, screenshots, and deep code analysis.
+The bugs are intentionally difficult - trust the evidence.
 
 ================================================================================
 USER CONTENT:
 ================================================================================
 
---- BROKEN TEST FILE: tests/calculator.test.js ---
-const { calculateTotal, calculateDiscount } = require('../src/calculator');
+[ITERATION: False]
 
-describe('Calculator', () => {
-  test('calculateTotal should multiply price and quantity', () => {
-    expect(calculateTotal(10, 5)).toBe(50);
+--- BROKEN TEST FILE: tests/e2e/t1.spec.js ---
+import { test, expect } from '@playwright/test';
+
+test.describe('Level 1: Async Button', () => {
+  
+  test('should save user profile successfully', async ({ page }) => {
+    await page.goto('/level1');
+    
+    await page.fill('#username', 'testuser');
+    await page.fill('#email', 'test@example.com');
+    
+    await page.click('.save-btn');
+    
+    await expect(page.locator('#successMsg')).toBeVisible();
   });
-
-  test('calculateTotal should handle decimal values', () => {
-    expect(calculateTotal(12.99, 3)).toBe(38.97);
-  });
-
-  test('calculateDiscount should calculate percentage correctly', () => {
-    expect(calculateDiscount(100, 20)).toBe(20);
-  });
-
-  test('calculateDiscount should work with decimal discounts', () => {
-    expect(calculateDiscount(50, 15)).toBe(7.5);
-  }); 
+  
 });
 
 
 --- IMPORTED DEPENDENCIES (Context Files) ---
 
-### src/calculator.js
+### tests/e2e/t2.spec.js
 ```
-function calculateTotal(price, quantity) {
-  return price + quantity;
-}
+import { test, expect } from '@playwright/test';
 
-function calculateDiscount(price, discountPercent) {
-  return price * (discountPercent / 100);
-}
-
-module.exports = {
-  calculateTotal,
-  calculateDiscount
-};
+test.describe('Level 2: Dynamic Modal', () => {
+  
+  test('should accept terms of service', async ({ page }) => {
+    await page.goto('/level2');
+    
+    await page.click('#showModal');
+    
+    await expect(page.locator('.modal-overlay')).toBeVisible();
+    
+    await page.click('.modal-accept-btn');
+    
+    await expect(page.locator('#result')).toHaveText('✓ Terms Accepted');
+  });
+  
+});
 
 ```
 
 
 --- REPOSITORY FILE STRUCTURE ---
-.github/workflows/test.yml
+.github/kintsugi.yml
+.github/workflows/stress-test.yml
+.gitignore
 README.md
+package-lock.json
 package.json
-src/calculator.js
-tests/calculator.test.js
+playwright-report/index.html
+playwright.config.js
+src/api/mock-payment.js
+src/components/AsyncButton.jsx
+src/components/DynamicModal.jsx
+src/logic/currency-math.js
+src/server.js
+test-results/.last-run.json
+tests/e2e/t1.spec.js
+tests/e2e/t2.spec.js
+tests/e2e/t3.spec.js
+tests/e2e/t4.spec.js
+tests/page-objects/CheckoutPage.js
 
 --- ERROR LOG ---
-No artifact error log available.
+--- test-results/t1-Level-1-Async-Button-sh-e6f7e-e-user-profile-successfully-gauntlet/error-context.md ---
+# Page snapshot
 
-[NO SCREENSHOT AVAILABLE]
+```yaml
+- generic [active] [ref=e1]:
+  - heading "User Profile" [level=1] [ref=e2]
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - text: "Username:"
+      - textbox "Enter username" [ref=e5]: testuser
+    - generic [ref=e6]:
+      - text: "Email:"
+      - textbox "Enter email" [ref=e7]: test@example.com
+    - button "Save Changes" [ref=e8] [cursor=pointer]
+  - generic [ref=e9]: ✓ Profile saved successfully!
+```
 
-Analyze the error log and code, then generate robust fix(es). Return JSON. (Note: No screenshot available for this run)
+--- test-results/t1-Level-1-Async-Button-sh-e6f7e-e-user-profile-successfully-gauntlet-retry1/error-context.md ---
+# Page snapshot
+
+```yaml
+- generic [active] [ref=e1]:
+  - heading "User Profile" [level=1] [ref=e2]
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - text: "Username:"
+      - textbox "Enter username" [ref=e5]: testuser
+    - generic [ref=e6]:
+      - text: "Email:"
+      - textbox "Enter email" [ref=e7]: test@example.com
+    - button "Save Changes" [ref=e8] [cursor=pointer]
+  - generic [ref=e9]: ✓ Profile saved successfully!
+```
+
+--- test-results/t2-Level-2-Dynamic-Modal-should-accept-terms-of-service-gauntlet/error-context.md ---
+# Page snapshot
+
+```yaml
+- generic [ref=e1]:
+  - heading "Terms of Service" [level=1] [ref=e2]
+  - paragraph [ref=e3]: Please review and accept our terms to continue.
+  - button "Review Terms" [active] [ref=e4] [cursor=pointer]
+  - generic [ref=e6]:
+    - heading "Terms of Service" [level=2] [ref=e7]
+    - paragraph [ref=e8]: Do you accept our terms and conditions?
+    - generic [ref=e9]:
+      - button "Decline" [ref=e10] [cursor=pointer]
+      - button "Accept" [ref=e11] [cursor=pointer]
+```
+
+[VIDEO ATTACHED: video/webm - files/ywgx6ketqmb7]
+
+[SCREENSHOT ATTACHED: image/png]
+
+Analyze the error log, screenshot, and video recording, then generate robust fix(es). Return JSON.

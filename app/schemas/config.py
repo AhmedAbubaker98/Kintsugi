@@ -19,6 +19,7 @@ class LimitsConfig(BaseModel):
     """Safety limits to prevent runaway costs and changes."""
     max_attempts: int = Field(default=3, ge=1, le=10)  # Cap at 10 for stress testing
     max_files_changed: int = Field(default=2, ge=1)
+    max_import_depth: int = Field(default=3, ge=1, le=10, description="Maximum depth for recursive import parsing")
 
 
 class SecurityConfig(BaseModel):
@@ -50,6 +51,14 @@ class TestConfig(BaseModel):
     command: Optional[str] = None  # e.g., "npx playwright test {test_file}"
 
 
+class UpdatesConfig(BaseModel):
+    """Configuration for progress updates during fix attempts."""
+    mode: str = Field(
+        default="silent",
+        description="Update mode: 'silent' (no updates until final PR) or 'transparent' (draft PR with live status comments)"
+    )
+
+
 class KintsugiConfig(BaseModel):
     """
     Root configuration object for Kintsugi.
@@ -66,6 +75,7 @@ class KintsugiConfig(BaseModel):
     limits:
       max_attempts: 3
       max_files_changed: 2
+      max_import_depth: 3  # Depth for recursive import parsing
     security:
       protected_paths:
         - ".github/**"
@@ -73,6 +83,8 @@ class KintsugiConfig(BaseModel):
     ai:
       mode: "smart"
       extra_instructions: "Prefer data-testid attributes"
+    updates:
+      mode: "transparent"  # 'silent' or 'transparent' for live progress updates
     ```
     """
     version: int = 1
@@ -93,3 +105,4 @@ class KintsugiConfig(BaseModel):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     testing: TestConfig = Field(default_factory=TestConfig)
+    updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
