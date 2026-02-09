@@ -72,6 +72,62 @@ class GitHubService:
         """Headers for installation-scoped requests."""
         return self._build_headers(installation_token, accept)
     
+    async def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        max_retries: int = 5,
+        **kwargs
+    ) -> httpx.Response:
+        """Make HTTP request with retry logic for 429 rate limits.
+        
+        Args:
+            method: HTTP method (GET, POST, PATCH, etc.)
+            url: Request URL
+            headers: Request headers
+            max_retries: Maximum number of retries
+            **kwargs: Additional arguments passed to httpx request
+        
+        Returns:
+            httpx.Response: The response object
+        
+        Raises:
+            httpx.HTTPStatusError: If non-429 error or max retries exceeded
+        """
+        import asyncio
+        
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.request(method, url, headers=headers, **kwargs)
+                    response.raise_for_status()
+                    return response
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429 and attempt < max_retries - 1:
+                    # Rate limited - use exponential backoff
+                    retry_after = e.response.headers.get("Retry-After")
+                    if retry_after:
+                        wait_time = int(retry_after)
+                    else:
+                        wait_time = min(2 ** attempt * 2, 60)  # Exponential backoff, max 60s
+                    
+                    logger.warning(
+                        f"⚠️ Rate limited (429) on {method} {url}, waiting {wait_time}s "
+                        f"(Attempt {attempt+1}/{max_retries})..."
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    # Re-raise on non-429 errors or max retries reached
+                    raise
+        
+        # Should not reach here, but just in case
+        raise httpx.HTTPStatusError(
+            f"Max retries ({max_retries}) exceeded",
+            request=None,
+            response=None
+        )
+    
     async def get_app_jwt(self) -> str:
         """
         Generate a JSON Web Token (JWT) for GitHub App authentication.
@@ -104,10 +160,8 @@ class GitHubService:
             "Accept": "application/vnd.github.v3+json",
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            return response.json()
+        response = await self._request_with_retry("GET", url, headers)
+        return response.json()
         
     async def get_installation_token(self, installation_id: int) -> str:
         """
@@ -416,14 +470,14 @@ class GitHubService:
         """
         logger.debug(f"Pushing commit to {owner}/{repo}:{branch}")
         token = await self.get_installation_token(installation_id)
-        async with httpx.AsyncClient() as client:
-            ref_resp = await client.get(
-                f"{self.base_url}/repos/{owner}/{repo}/git/refs/heads/{branch}",
-                headers=self._install_headers(token),
-            )
-            ref_resp.raise_for_status()
-            ref_data = ref_resp.json()
-            parent_sha = ref_data["object"]["sha"]
+        
+        ref_resp = await self._request_with_retry(
+            "GET",
+            f"{self.base_url}/repos/{owner}/{repo}/git/refs/heads/{branch}",
+            self._install_headers(token),
+        )
+        ref_data = ref_resp.json()
+        parent_sha = ref_data["object"]["sha"]
 
         return await self.create_commit(
             installation_id=installation_id,
@@ -458,14 +512,14 @@ class GitHubService:
         """
         logger.debug(f"Creating comment on {owner}/{repo}#{pull_number}")
         token = await self.get_installation_token(installation_id)
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{self.base_url}/repos/{owner}/{repo}/issues/{pull_number}/comments",
-                headers=self._install_headers(token),
-                json={"body": body},
-            )
-            response.raise_for_status()
-            return response.json()
+        
+        response = await self._request_with_retry(
+            "POST",
+            f"{self.base_url}/repos/{owner}/{repo}/issues/{pull_number}/comments",
+            self._install_headers(token),
+            json={"body": body},
+        )
+        return response.json()
     
     async def update_pr_comment(
         self,
@@ -490,14 +544,14 @@ class GitHubService:
         """
         logger.debug(f"Updating comment {comment_id} on {owner}/{repo}")
         token = await self.get_installation_token(installation_id)
-        async with httpx.AsyncClient() as client:
-            response = await client.patch(
-                f"{self.base_url}/repos/{owner}/{repo}/issues/comments/{comment_id}",
-                headers=self._install_headers(token),
-                json={"body": body},
-            )
-            response.raise_for_status()
-            return response.json()
+        
+        response = await self._request_with_retry(
+            "PATCH",
+            f"{self.base_url}/repos/{owner}/{repo}/issues/comments/{comment_id}",
+            self._install_headers(token),
+            json={"body": body},
+        )
+        return response.json()
     
     async def get_pull_request(
         self,
@@ -520,13 +574,13 @@ class GitHubService:
         """
         logger.debug(f"Fetching PR: {owner}/{repo}#{pull_number}")
         token = await self.get_installation_token(installation_id)
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{self.base_url}/repos/{owner}/{repo}/pulls/{pull_number}",
-                headers=self._install_headers(token),
-            )
-            response.raise_for_status()
-            return response.json()
+        
+        response = await self._request_with_retry(
+            "GET",
+            f"{self.base_url}/repos/{owner}/{repo}/pulls/{pull_number}",
+            self._install_headers(token),
+        )
+        return response.json()
 
     async def update_pull_request(
         self,
@@ -560,14 +614,13 @@ class GitHubService:
         if body is not None:
             payload["body"] = body
         
-        async with httpx.AsyncClient() as client:
-            response = await client.patch(
-                f"{self.base_url}/repos/{owner}/{repo}/pulls/{pull_number}",
-                headers=self._install_headers(token),
-                json=payload,
-            )
-            response.raise_for_status()
-            return response.json()
+        response = await self._request_with_retry(
+            "PATCH",
+            f"{self.base_url}/repos/{owner}/{repo}/pulls/{pull_number}",
+            self._install_headers(token),
+            json=payload,
+        )
+        return response.json()
 
     async def update_file(
         self,
@@ -633,11 +686,9 @@ class GitHubService:
         url = f"{self.base_url}/repos/{repo_full_name}/git/ref/heads/{branch}"
         headers = self._install_headers(token)
         
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            return data["object"]["sha"]
+        response = await self._request_with_retry("GET", url, headers)
+        data = response.json()
+        return data["object"]["sha"]
 
     async def create_branch(
         self,
@@ -667,10 +718,8 @@ class GitHubService:
         }
 
         logger.debug(f"Creating branch: {new_branch_name} from {source_sha[:8]}")
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            return response.json()
+        response = await self._request_with_retry("POST", url, headers, json=payload)
+        return response.json()
 
     async def create_pull_request(
         self,
@@ -709,10 +758,8 @@ class GitHubService:
         }
 
         logger.debug(f"Creating PR: {head} -> {base} (draft={draft})")
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            return response.json()
+        response = await self._request_with_retry("POST", url, headers, json=payload)
+        return response.json()
 
     async def list_repository_files(
         self,
