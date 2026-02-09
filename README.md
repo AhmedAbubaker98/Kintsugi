@@ -7,6 +7,7 @@
 ---
 
 ## 🚀 Quick Start
+(Kintsugi will be available for general use on Feb 10th)
 
 ### Step 1: Install the GitHub App
 

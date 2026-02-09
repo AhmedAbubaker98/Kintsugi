@@ -1002,16 +1002,37 @@ class WorkflowProcessor:
         return context_files
 
     async def _get_artifacts_with_retry(
-        self, token: str, repo_full_name: str, run_id: int, retries: int = 3
+        self, token: str, repo_full_name: str, run_id: int, retries: int = 5
     ) -> list:
-        """Fetch artifacts with retry logic."""
+        """Fetch artifacts with retry logic including 429 rate limit handling."""
+        import httpx
+        
         for attempt in range(retries):
-            artifacts_data = await self.github.list_workflow_artifacts(token, repo_full_name, run_id)
-            artifacts = artifacts_data.get("artifacts", [])
-            if artifacts:
-                return artifacts
-            logger.info(f"Artifacts list empty, retrying in 2s (Attempt {attempt+1}/{retries})...")
-            await asyncio.sleep(2)
+            try:
+                artifacts_data = await self.github.list_workflow_artifacts(token, repo_full_name, run_id)
+                artifacts = artifacts_data.get("artifacts", [])
+                if artifacts:
+                    return artifacts
+                logger.info(f"Artifacts list empty, retrying in 2s (Attempt {attempt+1}/{retries})...")
+                await asyncio.sleep(2)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    # Rate limited - use exponential backoff
+                    # Check for Retry-After header
+                    retry_after = e.response.headers.get("Retry-After")
+                    if retry_after:
+                        wait_time = int(retry_after)
+                    else:
+                        wait_time = min(2 ** attempt * 2, 60)  # Exponential backoff, max 60s
+                    
+                    logger.warning(
+                        f"⚠️ Rate limited (429), waiting {wait_time}s before retry "
+                        f"(Attempt {attempt+1}/{retries})..."
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    # Re-raise non-429 errors
+                    raise
         return []
 
     def _parse_artifact_id_from_logs(self, logs: str) -> int | None:
